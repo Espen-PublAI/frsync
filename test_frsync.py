@@ -227,6 +227,31 @@ def test_write_command_fits_line_budget():
             f"wrapper reserve too small: command is {len(cmd)} > {frsync.PUSH_CMD_BUDGET}"
 
 
+def test_local_glob_expansion(tmpdir):
+    for n in ("a.c", "b.c", "cloud1.c", "cloud2.c", "note.txt"):
+        open(os.path.join(tmpdir, n), "w").close()
+    bn = lambda L: sorted(os.path.basename(p) for p in L)
+    assert bn(frsync.expand_local_arg(tmpdir, "*.c")) == ["a.c", "b.c", "cloud1.c", "cloud2.c"]
+    assert bn(frsync.expand_local_arg(tmpdir, "cloud*.c")) == ["cloud1.c", "cloud2.c"]
+    assert bn(frsync.expand_local_arg(tmpdir, "*.*")) == ["a.c", "b.c", "cloud1.c", "cloud2.c", "note.txt"]
+    assert bn(frsync.expand_local_arg(tmpdir, "a.c")) == ["a.c"]              # literal that exists
+    assert frsync.expand_local_arg(tmpdir, "*.xyz") == []                     # glob, no match
+    # a plain (non-glob) name returns its path even if missing, for a clean error
+    assert frsync.expand_local_arg(tmpdir, "gone.c") == [os.path.join(tmpdir, "gone.c")]
+
+
+def test_remote_glob_expansion():
+    class FakeMud:   # listdir returns (name, size); -2 marks a directory
+        def listdir(self, path):
+            return [("a.c", 10), ("b.c", 20), ("sub", -2), ("cloud1.c", 5), ("note.txt", 3)]
+    m = FakeMud()
+    assert frsync.expand_remote_arg(m, "*.c", "/w/x") == ["/w/x/a.c", "/w/x/b.c", "/w/x/cloud1.c"]
+    assert frsync.expand_remote_arg(m, "cloud*.c", "/w/x") == ["/w/x/cloud1.c"]
+    # *.* matches files with a dot; the 'sub' directory is excluded
+    assert frsync.expand_remote_arg(m, "*.*", "/w/x") == ["/w/x/a.c", "/w/x/b.c", "/w/x/cloud1.c", "/w/x/note.txt"]
+    assert frsync.expand_remote_arg(m, "a.c", "/w/x") == ["/w/x/a.c"]         # literal, no listing needed
+
+
 # --------------------------------------------------------------------- runner
 class _FakeSelf:
     """Stand-in for a Mud instance: _write_once only touches _flush/send/expect."""
@@ -255,6 +280,8 @@ def main():
         ("stream UTF-8 split across reads",         lambda: test_stream_utf8_split_across_reads()),
         ("stream IAC inside multibyte char",        lambda: test_stream_iac_inside_multibyte_char()),
         ("write command fits line budget",          lambda: test_write_command_fits_line_budget()),
+        ("local glob expansion (*.c, cloud*.c)",     lambda: test_local_glob_expansion(tmp)),
+        ("remote glob expansion (*.c, *.*)",         lambda: test_remote_glob_expansion()),
     ]
     failed = 0
     for name, fn in tests:

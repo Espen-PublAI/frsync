@@ -34,7 +34,7 @@ OPTIONS
 Password: read from $FRPASS if set, otherwise prompted (never stored).
 Pure Python 3 standard library — one file, share it freely.
 """
-import argparse, getpass, os, re, select, socket, sys, time, zlib
+import argparse, fnmatch, getpass, glob, os, re, select, socket, sys, time, zlib
 try:
     import termios, tty          # POSIX-only; absent on Windows
 except ImportError:
@@ -629,6 +629,31 @@ def resolve_remote(arg, rcwd):
             parts.append(seg)
     return "/" + "/".join(parts)
 
+def _has_glob(s):
+    return any(c in s for c in "*?[")
+
+def expand_local_arg(localdir, pattern):
+    """Expand one /upload argument (a filename or a glob like *.c, cloud*.c, *.*)
+    to a list of existing local file paths. A plain name returns [its path] even
+    if missing, so the caller can report 'no such file'."""
+    full = os.path.join(localdir, pattern)        # an absolute pattern overrides localdir
+    if not _has_glob(pattern):
+        return [full]
+    return sorted(p for p in glob.glob(full) if os.path.isfile(p))
+
+def expand_remote_arg(mud, pattern, rcwd):
+    """Expand one /download argument against the server. A glob in the final
+    path component is matched by listing its directory; a plain name returns
+    [its resolved path]. Returns absolute remote file paths (directories
+    excluded)."""
+    full = resolve_remote(pattern, rcwd)
+    base = full.rsplit("/", 1)[-1]
+    if not _has_glob(base):
+        return [full]
+    rdir = full[: len(full) - len(base)].rstrip("/") or "/"
+    names = [n for n, s in mud.listdir(rdir) if s != -2]    # files only, skip dirs
+    return [f"{rdir.rstrip('/')}/{n}" for n in sorted(fnmatch.filter(names, base))]
+
 def cmd_connect(args):
     """Interactive MUD shell: you're connected like telnet (all normal MUD and
     creator commands go straight to the server), plus local /commands to move
@@ -657,7 +682,7 @@ def cmd_connect(args):
         "   Remote folder\r\n"
         "     /rcd <dir>        set the remote folder used for transfers\r\n"
         "\r\n"
-        "   Transfer files\r\n"
+        "   Transfer files   (names or globs: *.c, cloud*.c, *.* — space-separated)\r\n"
         "     /download f [..]  pull file(s)   remote → local   (alias /get)\r\n"
         "     /upload   f [..]  push file(s)   local → remote   (alias /put)\r\n"
         "\r\n"
@@ -686,24 +711,30 @@ def cmd_connect(args):
             state["rcwd"] = resolve_remote(a[0], state["rcwd"]) if a else home
             out(f"\r\n  remote dir = {state['rcwd']}\r\n")
         elif cmd in ("/download", "/get"):
-            for f in a:
-                rp = resolve_remote(f, state["rcwd"])
-                sz = mud.file_size(rp)
-                if sz < 0: out(f"\r\n  ✗ {f}: not found on MUD\r\n"); continue
-                data = mud.read_file_bytes(rp, sz)
-                lp = os.path.join(state["local"], os.path.basename(rp))
-                open(lp, "wb").write(data)
-                ok = len(data) == sz
-                out(f"\r\n  {'↓' if ok else '✗'} {os.path.basename(rp)} ({len(data)} b) -> {lp}\r\n")
+            if not a: out("\r\n  usage: /download <file|glob> [..]   (e.g. *.c)\r\n")
+            for pat in a:
+                targets = expand_remote_arg(mud, pat, state["rcwd"])
+                if not targets: out(f"\r\n  ✗ {pat}: no remote files match\r\n"); continue
+                for rp in targets:
+                    sz = mud.file_size(rp)
+                    if sz < 0: out(f"\r\n  ✗ {os.path.basename(rp)}: not found on MUD\r\n"); continue
+                    data = mud.read_file_bytes(rp, sz)
+                    lp = os.path.join(state["local"], os.path.basename(rp))
+                    open(lp, "wb").write(data)
+                    ok = len(data) == sz
+                    out(f"\r\n  {'↓' if ok else '✗'} {os.path.basename(rp)} ({len(data)} b) -> {lp}\r\n")
         elif cmd in ("/upload", "/put"):
-            for f in a:
-                lp = f if os.path.isabs(f) else os.path.join(state["local"], f)
-                if not os.path.isfile(lp): out(f"\r\n  ✗ {f}: no such local file\r\n"); continue
-                rp = resolve_remote(os.path.basename(f), state["rcwd"])
-                try:
-                    ok = push_one(mud, lp, rp, made)
-                    out(f"\r\n  {'↑' if ok else '✗'} {os.path.basename(f)} -> {rp}\r\n")
-                except Exception as e: out(f"\r\n  ✗ {f}: {str(e)[:70]}\r\n")
+            if not a: out("\r\n  usage: /upload <file|glob> [..]   (e.g. *.c)\r\n")
+            for pat in a:
+                matches = expand_local_arg(state["local"], pat)
+                if not matches: out(f"\r\n  ✗ {pat}: no local files match\r\n"); continue
+                for lp in matches:
+                    if not os.path.isfile(lp): out(f"\r\n  ✗ {os.path.basename(lp)}: no such local file\r\n"); continue
+                    rp = resolve_remote(os.path.basename(lp), state["rcwd"])
+                    try:
+                        ok = push_one(mud, lp, rp, made)
+                        out(f"\r\n  {'↑' if ok else '✗'} {os.path.basename(lp)} -> {rp}\r\n")
+                    except Exception as e: out(f"\r\n  ✗ {os.path.basename(lp)}: {str(e)[:70]}\r\n")
         else:
             out(f"\r\n  unknown /command: {cmd}  (try /help)\r\n")
         return True

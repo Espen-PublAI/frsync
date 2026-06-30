@@ -60,13 +60,18 @@ for moving files:
 
 | Command | Does |
 |---|---|
-| `/upload <file>`   | send a local file → the remote folder |
-| `/download <file>` | fetch a remote file → this computer |
-| `/where`           | show your current local + remote folders |
-| `/lcd <dir>`       | change the **local** folder (downloads land here) |
-| `/rcd <dir>`       | change the **remote** folder (transfers use this) |
-| `/lpwd`, `/lls`    | print / list the local folder |
-| `/help`, `/quit`   | full command list / leave |
+| `/upload <f> [..]`   | send local file(s) → the remote folder |
+| `/download <f> [..]` | fetch remote file(s) → this computer |
+| `/where`             | show your current local + remote folders |
+| `/lcd <dir>`         | change the **local** folder (downloads land here) |
+| `/rcd <dir>`         | change the **remote** folder (transfers use this) |
+| `/lpwd`, `/lls`      | print / list the local folder |
+| `/help`, `/quit`     | full command list / leave |
+
+`/upload` and `/download` take **multiple files and glob patterns** —
+space-separated names, or wildcards like `*.c`, `cloud*.c`, `*.*`. Uploads glob
+against your local folder; downloads glob against the remote folder. For example
+`/upload *.c` or `/download room*.c a.c b.c`.
 
 Downloaded files land in **`./downloads`** by default (created automatically,
 relative to where you launched), so they don't clutter your working folder.
