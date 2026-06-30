@@ -73,6 +73,11 @@ space-separated names, or wildcards like `*.c`, `cloud*.c`, `*.*`. Uploads glob
 against your local folder; downloads glob against the remote folder. For example
 `/upload *.c` or `/download room*.c a.c b.c`.
 
+If a transfer would **overwrite an existing file**, you're warned and asked
+`overwrite? [y/N]` first (per file, defaulting to No) — so a stray `/upload *.c`
+can't silently clobber your work. (The scriptable `push`/`pull` already compare
+and confirm; this brings the interactive shell in line.)
+
 Downloaded files land in **`./downloads`** by default (created automatically,
 relative to where you launched), so they don't clutter your working folder.
 Change it any time with `/lcd <dir>`, or start elsewhere with

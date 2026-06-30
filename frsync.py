@@ -670,6 +670,15 @@ def cmd_connect(args):
     state = {"local": local, "rcwd": home or "/"}
     made = set()
 
+    # Overwrite confirmation. Each terminal mode installs its own prompt fn
+    # below (single keypress in raw mode, a line read in the fallback).
+    confirm_overwrite = None
+    def overwrite_ok(what):
+        """Ask before clobbering an existing destination; default No. Returns
+        True to proceed. With no interactive prompt available, preserves the
+        old always-overwrite behaviour."""
+        return confirm_overwrite(what) if confirm_overwrite else True
+
     HELP = (
         "\r\n"
         "  ── FRsync commands ──   (anything else you type goes straight to the MUD)\r\n"
@@ -718,8 +727,11 @@ def cmd_connect(args):
                 for rp in targets:
                     sz = mud.file_size(rp)
                     if sz < 0: out(f"\r\n  ✗ {os.path.basename(rp)}: not found on MUD\r\n"); continue
-                    data = mud.read_file_bytes(rp, sz)
                     lp = os.path.join(state["local"], os.path.basename(rp))
+                    if os.path.exists(lp) and not overwrite_ok(
+                            f"{os.path.basename(lp)} already exists locally — overwrite?"):
+                        out(f"\r\n  • skipped {os.path.basename(rp)}\r\n"); continue
+                    data = mud.read_file_bytes(rp, sz)
                     open(lp, "wb").write(data)
                     ok = len(data) == sz
                     out(f"\r\n  {'↓' if ok else '✗'} {os.path.basename(rp)} ({len(data)} b) -> {lp}\r\n")
@@ -731,6 +743,9 @@ def cmd_connect(args):
                 for lp in matches:
                     if not os.path.isfile(lp): out(f"\r\n  ✗ {os.path.basename(lp)}: no such local file\r\n"); continue
                     rp = resolve_remote(os.path.basename(lp), state["rcwd"])
+                    if mud.file_size(rp) >= 0 and not overwrite_ok(
+                            f"{os.path.basename(rp)} already exists on the MUD — overwrite?"):
+                        out(f"\r\n  • skipped {os.path.basename(lp)}\r\n"); continue
                     try:
                         ok = push_one(mud, lp, rp, made)
                         out(f"\r\n  {'↑' if ok else '✗'} {os.path.basename(lp)} -> {rp}\r\n")
@@ -761,6 +776,12 @@ def cmd_connect(args):
     # terminal; falls back to plain line mode otherwise (pipes, Windows).
     _termios, _tty = termios, tty   # locals so the None-guard below narrows cleanly
     if _termios is None or _tty is None or not sys.stdin.isatty():
+        def _confirm_cooked(what):
+            out(f"\r\n  {what} [y/N] ")
+            try: ans = sys.stdin.readline().strip().lower()
+            except Exception: ans = ""
+            return ans in ("y", "yes")
+        confirm_overwrite = _confirm_cooked
         try:
             while True:
                 r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
@@ -785,6 +806,14 @@ def cmd_connect(args):
     in_carry = b""        # incomplete trailing UTF-8 bytes from a read
     _tty.setcbreak(fd)    # char-at-a-time, no echo (we echo manually); Ctrl-C still signals
     restore_term = lambda: _termios.tcsetattr(fd, _termios.TCSADRAIN, old_attr)
+    def _confirm_raw(what):
+        out(f"\r\n  {what} [y/N] ")
+        try: ch = os.read(fd, 1)        # single keypress, no Enter needed
+        except OSError: ch = b""
+        ans = ch.decode("latin-1", "replace")
+        out((ans if ans.isprintable() else "") + "\r\n")
+        return ans in ("y", "Y")
+    confirm_overwrite = _confirm_raw
     try:
         while True:
             r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
