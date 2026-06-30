@@ -578,14 +578,26 @@ def cmd_connect(args):
     made = set()
 
     HELP = (
-        "\r\n  Local commands (everything else goes to the MUD):\r\n"
-        "    /lcd <dir>         set your local folder (downloads land here)\r\n"
-        "    /lpwd  /lls        show / list your local folder\r\n"
-        "    /rcd <dir>         set the remote folder used for transfers\r\n"
-        "    /download f [..]   (/get) pull file(s) from remote folder -> local\r\n"
-        "    /upload f [..]     (/put) push file(s) from local -> remote folder\r\n"
-        "    /where             show current local + remote folders\r\n"
-        "    /help   /quit\r\n")
+        "\r\n"
+        "  ── FRsync commands ──   (anything else you type goes straight to the MUD)\r\n"
+        "\r\n"
+        "   Local folder\r\n"
+        "     /lcd <dir>        set your local folder (downloads land here)\r\n"
+        "     /lpwd             print the local folder\r\n"
+        "     /lls              list the local folder\r\n"
+        "\r\n"
+        "   Remote folder\r\n"
+        "     /rcd <dir>        set the remote folder used for transfers\r\n"
+        "\r\n"
+        "   Transfer files\r\n"
+        "     /download f [..]  pull file(s)   remote → local   (alias /get)\r\n"
+        "     /upload   f [..]  push file(s)   local → remote   (alias /put)\r\n"
+        "\r\n"
+        "   Session\r\n"
+        "     /where            show current local + remote folders\r\n"
+        "     /help             show this help\r\n"
+        "     /quit             leave FRsync\r\n"
+        "\r\n")
 
     def do_local(line):
         parts = line.split()
@@ -629,6 +641,9 @@ def cmd_connect(args):
         return True
 
     out(do_where_banner(state))
+    # auto-look on entry so you can see where you are right away
+    mud._flush(); mud.send("look")
+    out("\r\n" + mud.drain(1.0))
     sock = mud.s
     try:
         while True:
