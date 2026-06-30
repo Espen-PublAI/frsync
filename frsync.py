@@ -683,7 +683,7 @@ def render_batch_bar(done, total, idx, count, label, width=22):
     frac = 1.0 if total <= 0 else min(max(done, 0) / total, 1.0)
     fill = int(frac * width)
     bar = "█" * fill + "░" * (width - fill)
-    return (f"\r  [{bar}] {int(frac*100):3d}%  ({idx}/{count}) "
+    return (f"  [{bar}] {int(frac*100):3d}%  ({idx}/{count}) "
             f"{label[:16]:<16} {human_size(done)}/{human_size(total)}")
 
 def cli_progress(label):
@@ -720,18 +720,47 @@ def cmd_connect(args):
     # below (single keypress in raw mode, a line read in the fallback) that
     # returns one lowercased char.
     ask_key = None
-    def ask_overwrite(name, mode):
-        """Ask whether to overwrite an existing destination, honoring a sticky
-        all/none mode. Returns (decision, mode) where decision is yes|no|quit:
-          y yes (this)   n no (this)   a yes-to-all   s no-to-all   q quit."""
-        if mode == "all":  return "yes", mode
-        if mode == "none": return "no", mode
-        ans = ask_key(f"\r\n  {name} already exists — overwrite? "
-                      f"[y]es [n]o [a]ll-yes [s]kip-all [q]uit ") if ask_key else "y"
-        if ans == "a": return "yes", "all"
-        if ans == "s": return "no", "none"
-        if ans == "q": return "quit", mode
-        return ("yes" if ans == "y" else "no"), mode
+    def batch_transfer(jobs, arrow, dest):
+        """Run transfer `jobs` with ONE progress bar pinned at the bottom of the
+        screen; overwrite prompts and per-file notes scroll above it.
+        jobs: list of {base, size, exists(bool), run(progress)->ok}.
+        Overwrite keys: y / n / a=yes-to-all / s=no-to-all / q=quit."""
+        st = {"total": sum(j["size"] for j in jobs), "done": 0,
+              "did": 0, "skip": 0, "mode": None, "shown": False}
+        n = len(jobs)
+        def draw(extra, label):
+            idx = min(st["did"] + st["skip"] + 1, n)
+            out("\r\x1b[K" + render_batch_bar(st["done"] + extra, st["total"], idx, n, label))
+            st["shown"] = True
+        def note(msg):                       # print a line above the bar
+            out(("\r\x1b[K" if st["shown"] else "") + msg + "\r\n")
+            st["shown"] = False
+        def skip(base, size):
+            note(f"  • skipped {base}"); st["skip"] += 1; st["total"] -= size
+        aborted = False
+        for j in jobs:
+            base, size = j["base"], j["size"]
+            if j["exists"] and st["mode"] != "all":
+                if st["mode"] == "none":
+                    skip(base, size); continue
+                if st["shown"]: out("\r\x1b[K"); st["shown"] = False   # clear bar to ask
+                ans = ask_key(f"  {base} already exists — overwrite? "
+                              f"[y]es [n]o [a]ll-yes [s]kip-all [q]uit ") if ask_key else "y"
+                if ans == "q": aborted = True; break
+                if ans == "a": st["mode"] = "all"
+                elif ans == "s": st["mode"] = "none"; skip(base, size); continue
+                elif ans != "y": skip(base, size); continue
+            draw(0, base)
+            try:
+                j["run"](lambda d, t, b=base: draw(d, b))
+            except Exception as e:
+                note(f"  ✗ {base}: {str(e)[:60]}"); continue
+            st["done"] += size; st["did"] += 1
+        if st["shown"]: out("\r\x1b[K")       # wipe the bar, leave the summary
+        msg = f"  {arrow} {st['did']} file(s), {human_size(st['done'])} -> {dest}"
+        if st["skip"]: msg += f"   ·  {st['skip']} skipped"
+        if aborted:    msg += "   ·  quit"
+        out(msg + "\r\n")
 
     HELP = (
         "\r\n"
@@ -775,70 +804,37 @@ def cmd_connect(args):
             out(f"\r\n  remote dir = {state['rcwd']}\r\n")
         elif cmd in ("/download", "/get"):
             if not a: out("\r\n  usage: /download <file|glob> [..]   (e.g. *.c)\r\n"); return True
-            # collect every matched remote file + its size
-            sized = []
+            jobs = []
             for pat in a:
                 t = expand_remote_arg(mud, pat, state["rcwd"])
                 if not t: out(f"\r\n  ✗ {pat}: no remote files match\r\n")
                 for rp in t:
                     sz = mud.file_size(rp)
                     if sz < 0: out(f"\r\n  ✗ {os.path.basename(rp)}: not found on MUD\r\n"); continue
-                    sized.append((rp, sz))
-            if not sized: return True
-            total = sum(sz for _, sz in sized); done = 0
-            nfiles = len(sized); mode = None
-            did = skip = 0; aborted = False
-            for idx, (rp, sz) in enumerate(sized, 1):
-                base = os.path.basename(rp)
-                lp = os.path.join(state["local"], base)
-                if os.path.exists(lp):
-                    decision, mode = ask_overwrite(base, mode)
-                    if decision == "quit": aborted = True; break
-                    if decision == "no":
-                        out(f"\r\n  • skipped {base}"); skip += 1; total -= sz; continue
-                out("\r\n")
-                data = mud.read_file_bytes(rp, sz, progress=lambda d, t, b=base, i=idx:
-                                           out(render_batch_bar(done + d, total, i, nfiles, b)))
-                open(lp, "wb").write(data); done += len(data); did += 1
-            out(f"\r\x1b[K  ↓ {did} file(s), {human_size(done)} -> {state['local']}")
-            if skip: out(f"   ·  {skip} skipped")
-            if aborted: out("   ·  quit")
-            out("\r\n")
+                    base = os.path.basename(rp); lp = os.path.join(state["local"], base)
+                    def fetch(progress, rp=rp, sz=sz, lp=lp):
+                        data = mud.read_file_bytes(rp, sz, progress=progress)
+                        open(lp, "wb").write(data); return len(data) == sz
+                    jobs.append({"base": base, "size": sz,
+                                 "exists": os.path.exists(lp), "run": fetch})
+            if not jobs: out("\r\n"); return True
+            out("\r\n"); batch_transfer(jobs, "↓", state["local"])
         elif cmd in ("/upload", "/put"):
             if not a: out("\r\n  usage: /upload <file|glob> [..]   (e.g. *.c)\r\n"); return True
-            # collect every matched local file
-            files = []
+            jobs = []
             for pat in a:
                 m = expand_local_arg(state["local"], pat)
                 if not m: out(f"\r\n  ✗ {pat}: no local files match\r\n")
                 for lp in m:
                     if not os.path.isfile(lp): out(f"\r\n  ✗ {os.path.basename(lp)}: no such local file\r\n"); continue
-                    files.append(lp)
-            if not files: return True
-            rp_of = lambda lp: resolve_remote(os.path.basename(lp), state["rcwd"])
-            sizes = {lp: len(local_norm(open(lp, "rb").read())) for lp in files}
-            total = sum(sizes.values()); done = 0
-            nfiles = len(files); mode = None
-            did = skip = 0; aborted = False
-            for idx, lp in enumerate(files, 1):
-                base = os.path.basename(lp); rp = rp_of(lp)
-                if mud.file_size(rp) >= 0:
-                    decision, mode = ask_overwrite(base, mode)
-                    if decision == "quit": aborted = True; break
-                    if decision == "no":
-                        out(f"\r\n  • skipped {base}"); skip += 1; total -= sizes[lp]; continue
-                out("\r\n")
-                try:
-                    if push_one(mud, lp, rp, made, progress=lambda d, t, b=base, i=idx:
-                                out(render_batch_bar(done + d, total, i, nfiles, b))):
-                        did += 1
-                except Exception as e:
-                    out(f"\r\x1b[K  ✗ {base}: {str(e)[:60]}\r\n")
-                done += sizes[lp]
-            out(f"\r\x1b[K  ↑ {did} file(s), {human_size(done)} -> {state['rcwd']}")
-            if skip: out(f"   ·  {skip} skipped")
-            if aborted: out("   ·  quit")
-            out("\r\n")
+                    base = os.path.basename(lp); rp = resolve_remote(base, state["rcwd"])
+                    sz = len(local_norm(open(lp, "rb").read()))
+                    def send(progress, lp=lp, rp=rp):
+                        return push_one(mud, lp, rp, made, progress=progress)
+                    jobs.append({"base": base, "size": sz,
+                                 "exists": mud.file_size(rp) >= 0, "run": send})
+            if not jobs: out("\r\n"); return True
+            out("\r\n"); batch_transfer(jobs, "↑", state["rcwd"])
         else:
             out(f"\r\n  unknown /command: {cmd}  (try /help)\r\n")
         return True
