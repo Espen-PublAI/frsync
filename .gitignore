@@ -1,7 +1,8 @@
 # --- Final Realms game content (NOT part of this tool, not ours to publish) ---
 MUD/
 drifting_forest/
-downloads/        # default landing folder for interactive /download
+# default landing folder for interactive /download
+downloads/
 *.log
 .frsync_done_dirs.txt
 .frsync_skipped.txt
