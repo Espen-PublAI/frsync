@@ -262,6 +262,19 @@ class _FakeSelf:
     def expect(self, pattern, timeout=12): return self._canned
 
 
+# Under pytest, the `monkey_self` parameter on the _write_once tests is a fixture
+# request: hand back the _FakeSelf factory the tests call as monkey_self(canned).
+# main() injects the same value by hand, so the standalone runner needs no pytest.
+try:
+    import pytest
+
+    @pytest.fixture(name="monkey_self")
+    def _monkey_self():
+        return _FakeSelf
+except ImportError:                      # standalone `python3 test_frsync.py`
+    pass
+
+
 def main():
     import tempfile
     tmp = tempfile.mkdtemp(prefix="frsync_test_")
