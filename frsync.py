@@ -728,7 +728,8 @@ def cmd_connect(args):
     # Keep what you're typing pinned at the bottom and redraw it when async MUD
     # output arrives, so input and server text never interleave. Needs a real
     # terminal; falls back to plain line mode otherwise (pipes, Windows).
-    if termios is None or tty is None or not sys.stdin.isatty():
+    _termios, _tty = termios, tty   # locals so the None-guard below narrows cleanly
+    if _termios is None or _tty is None or not sys.stdin.isatty():
         try:
             while True:
                 r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
@@ -746,11 +747,13 @@ def cmd_connect(args):
             out("\r\nDisconnected.\r\n"); mud.close()
         return
 
+    assert _termios is not None and _tty is not None   # guaranteed by the guard above
     fd = sys.stdin.fileno()
-    old_attr = termios.tcgetattr(fd)
+    old_attr = _termios.tcgetattr(fd)
     inbuf = []            # chars of the line being typed
     in_carry = b""        # incomplete trailing UTF-8 bytes from a read
-    tty.setcbreak(fd)     # char-at-a-time, no echo (we echo manually); Ctrl-C still signals
+    _tty.setcbreak(fd)    # char-at-a-time, no echo (we echo manually); Ctrl-C still signals
+    restore_term = lambda: _termios.tcsetattr(fd, _termios.TCSADRAIN, old_attr)
     try:
         while True:
             r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
@@ -796,7 +799,7 @@ def cmd_connect(args):
     except KeyboardInterrupt:
         pass
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+        restore_term()
         out("\r\nDisconnected.\r\n")
         mud.close()
 
