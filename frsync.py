@@ -718,25 +718,20 @@ def cmd_connect(args):
 
     # Overwrite confirmation. Each terminal mode installs its own key reader
     # below (single keypress in raw mode, a line read in the fallback) that
-    # returns one lowercased char: y / n / a(ll) / q(uit-rest).
+    # returns one lowercased char.
     ask_key = None
-    def decide_overwrites(items, exists, name):
-        """Walk `items`; for any whose destination already exists, ask whether
-        to overwrite — with 'a' = yes-to-all and 'q' = skip-all-remaining, so a
-        big batch is one keypress. Returns (to_transfer, skipped)."""
-        to_do, skipped, mode = [], [], None
-        for x in items:
-            if not exists(x):
-                to_do.append(x); continue
-            if mode == "all":  to_do.append(x); continue
-            if mode == "none": skipped.append(x); continue
-            ans = ask_key(f"\r\n  {name(x)} already exists — overwrite? "
-                          f"[y]es [n]o [a]ll [q]uit ") if ask_key else "y"
-            if   ans == "a": mode = "all";  to_do.append(x)
-            elif ans == "q": mode = "none"; skipped.append(x)
-            elif ans == "y": to_do.append(x)
-            else:            skipped.append(x)        # n / empty / anything else
-        return to_do, skipped
+    def ask_overwrite(name, mode):
+        """Ask whether to overwrite an existing destination, honoring a sticky
+        all/none mode. Returns (decision, mode) where decision is yes|no|quit:
+          y yes (this)   n no (this)   a yes-to-all   s no-to-all   q quit."""
+        if mode == "all":  return "yes", mode
+        if mode == "none": return "no", mode
+        ans = ask_key(f"\r\n  {name} already exists — overwrite? "
+                      f"[y]es [n]o [a]ll-yes [s]kip-all [q]uit ") if ask_key else "y"
+        if ans == "a": return "yes", "all"
+        if ans == "s": return "no", "none"
+        if ans == "q": return "quit", mode
+        return ("yes" if ans == "y" else "no"), mode
 
     HELP = (
         "\r\n"
@@ -790,21 +785,24 @@ def cmd_connect(args):
                     if sz < 0: out(f"\r\n  ✗ {os.path.basename(rp)}: not found on MUD\r\n"); continue
                     sized.append((rp, sz))
             if not sized: return True
-            lp_of = lambda it: os.path.join(state["local"], os.path.basename(it[0]))
-            to_do, skipped = decide_overwrites(
-                sized, lambda it: os.path.exists(lp_of(it)), lambda it: os.path.basename(it[0]))
-            for it in skipped: out(f"\r\n  • skipped {os.path.basename(it[0])}")
-            if not to_do: out("\r\n"); return True
-            total = sum(sz for _, sz in to_do); done = 0
-            out("\r\n")
-            for idx, (rp, sz) in enumerate(to_do, 1):
+            total = sum(sz for _, sz in sized); done = 0
+            nfiles = len(sized); mode = None
+            did = skip = 0; aborted = False
+            for idx, (rp, sz) in enumerate(sized, 1):
                 base = os.path.basename(rp)
+                lp = os.path.join(state["local"], base)
+                if os.path.exists(lp):
+                    decision, mode = ask_overwrite(base, mode)
+                    if decision == "quit": aborted = True; break
+                    if decision == "no":
+                        out(f"\r\n  • skipped {base}"); skip += 1; total -= sz; continue
+                out("\r\n")
                 data = mud.read_file_bytes(rp, sz, progress=lambda d, t, b=base, i=idx:
-                                           out(render_batch_bar(done + d, total, i, len(to_do), b)))
-                open(lp_of((rp, sz)), "wb").write(data)
-                done += len(data)
-            out(f"\r\x1b[K  ↓ {len(to_do)} file(s), {human_size(done)} -> {state['local']}")
-            if skipped: out(f"   ·  {len(skipped)} skipped")
+                                           out(render_batch_bar(done + d, total, i, nfiles, b)))
+                open(lp, "wb").write(data); done += len(data); did += 1
+            out(f"\r\x1b[K  ↓ {did} file(s), {human_size(done)} -> {state['local']}")
+            if skip: out(f"   ·  {skip} skipped")
+            if aborted: out("   ·  quit")
             out("\r\n")
         elif cmd in ("/upload", "/put"):
             if not a: out("\r\n  usage: /upload <file|glob> [..]   (e.g. *.c)\r\n"); return True
@@ -818,24 +816,28 @@ def cmd_connect(args):
                     files.append(lp)
             if not files: return True
             rp_of = lambda lp: resolve_remote(os.path.basename(lp), state["rcwd"])
-            to_do, skipped = decide_overwrites(
-                files, lambda lp: mud.file_size(rp_of(lp)) >= 0, os.path.basename)
-            for lp in skipped: out(f"\r\n  • skipped {os.path.basename(lp)}")
-            if not to_do: out("\r\n"); return True
-            sizes = {lp: len(local_norm(open(lp, "rb").read())) for lp in to_do}
-            total = sum(sizes.values()); done = 0; ok_count = 0
-            out("\r\n")
-            for idx, lp in enumerate(to_do, 1):
-                base = os.path.basename(lp)
+            sizes = {lp: len(local_norm(open(lp, "rb").read())) for lp in files}
+            total = sum(sizes.values()); done = 0
+            nfiles = len(files); mode = None
+            did = skip = 0; aborted = False
+            for idx, lp in enumerate(files, 1):
+                base = os.path.basename(lp); rp = rp_of(lp)
+                if mud.file_size(rp) >= 0:
+                    decision, mode = ask_overwrite(base, mode)
+                    if decision == "quit": aborted = True; break
+                    if decision == "no":
+                        out(f"\r\n  • skipped {base}"); skip += 1; total -= sizes[lp]; continue
+                out("\r\n")
                 try:
-                    if push_one(mud, lp, rp_of(lp), made, progress=lambda d, t, b=base, i=idx:
-                                out(render_batch_bar(done + d, total, i, len(to_do), b))):
-                        ok_count += 1
+                    if push_one(mud, lp, rp, made, progress=lambda d, t, b=base, i=idx:
+                                out(render_batch_bar(done + d, total, i, nfiles, b))):
+                        did += 1
                 except Exception as e:
                     out(f"\r\x1b[K  ✗ {base}: {str(e)[:60]}\r\n")
                 done += sizes[lp]
-            out(f"\r\x1b[K  ↑ {ok_count}/{len(to_do)} file(s), {human_size(total)} -> {state['rcwd']}")
-            if skipped: out(f"   ·  {len(skipped)} skipped")
+            out(f"\r\x1b[K  ↑ {did} file(s), {human_size(done)} -> {state['rcwd']}")
+            if skip: out(f"   ·  {skip} skipped")
+            if aborted: out("   ·  quit")
             out("\r\n")
         else:
             out(f"\r\n  unknown /command: {cmd}  (try /help)\r\n")

@@ -73,17 +73,26 @@ space-separated names, or wildcards like `*.c`, `cloud*.c`, `*.*`. Uploads glob
 against your local folder; downloads glob against the remote folder. For example
 `/upload *.c` or `/download room*.c a.c b.c`.
 
-If a transfer would **overwrite existing files**, you're asked up front —
-`overwrite? [y]es [n]o [a]ll [q]uit` — where **a** overwrites all remaining and
-**q** skips all remaining, so a big `/upload *.c` is one keypress, not one
-question per file. (The scriptable `push`/`pull` already compare and confirm.)
-
-The whole transfer then shows a **single progress bar** for the entire batch —
-total bytes across every file, and which file is moving right now:
+A multi-file transfer runs through the files one at a time, advancing a
+**single overall progress bar** (total bytes across the whole batch, and which
+file is moving) — so you watch it climb as you go:
 
 ```
   [████████████░░░░░░░░░░]  55%  (2/3) workroom2.c     5.0K/9.0K
 ```
+
+If a file would **overwrite an existing destination**, it asks right then:
+
+```
+  workroom.c already exists — overwrite? [y]es [n]o [a]ll-yes [s]kip-all [q]uit
+```
+
+- **y** / **n** — this file
+- **a** — yes to all remaining
+- **s** — no to all remaining (skip every existing file)
+- **q** — quit the transfer now
+
+(The scriptable `push`/`pull` already compare and confirm separately.)
 
 Downloaded files land in **`./downloads`** by default (created automatically,
 relative to where you launched), so they don't clutter your working folder.
