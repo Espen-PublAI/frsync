@@ -39,6 +39,10 @@ try:
     import termios, tty          # POSIX-only; absent on Windows
 except ImportError:
     termios = tty = None
+try:
+    import msvcrt                 # Windows-only console I/O; absent on POSIX
+except ImportError:
+    msvcrt = None
 
 DEF_HOST, DEF_PORT = "fr.hyssing.net", 4010
 PUSH_CMD_BUDGET = 900     # max chars in one `exec write_file(...)` line
@@ -859,125 +863,208 @@ def cmd_connect(args):
     # auto-look on entry so you can see where you are right away
     mud._flush(); mud.send("look")
     out("\r\n" + mud.drain(1.0))
-    sock = mud.s
 
     # Keep what you're typing pinned at the bottom and redraw it when async MUD
-    # output arrives, so input and server text never interleave. Needs a real
-    # terminal; falls back to plain line mode otherwise (pipes, Windows).
-    _termios, _tty = termios, tty   # locals so the None-guard below narrows cleanly
-    if _termios is None or _tty is None or not sys.stdin.isatty():
-        def _ask_key_cooked(prompt):
+    # output arrives, so input and server text never interleave. Two raw-mode
+    # paths share the line editor below — POSIX (termios) and Windows (msvcrt) —
+    # and a plain line-mode fallback covers pipes / non-terminals.
+    inbuf = []            # chars of the line being typed
+    history = []          # submitted lines, oldest first (Up/Down recalls them)
+    hidx = 0              # cursor into history; == len(history) means the live line
+    pending = ""          # live line stashed when you start scrolling up
+
+    def pump_socket(sk):
+        """Print pending MUD output and redraw the pinned input. False = closed."""
+        data = sk.recv(65536)
+        if not data:
+            out("\r\n*** MUD closed the connection. ***\r\n"); return False
+        text = mud._strip_iac(data)
+        if text:
+            if inbuf: out("\r\x1b[K" + text + "".join(inbuf))  # lift input, print, redraw
+            else:     out(text)
+        return True
+
+    def handle_key(kind, ch=""):
+        """Apply one logical key event to the input line. Returns False to quit."""
+        nonlocal hidx, pending
+        if kind == "text":                         # printable (incl. Unicode) -> echo
+            inbuf.append(ch); out(ch)
+        elif kind == "enter":                      # submit the line
+            out("\r\n")
+            line = "".join(inbuf); inbuf.clear()
+            if line and (not history or history[-1] != line):
+                history.append(line)               # keep it; skip blanks + dups
+            hidx = len(history); pending = ""       # back to a fresh live line
+            return handle_line(line)
+        elif kind == "backspace":
+            if inbuf: inbuf.pop(); out("\b \b")
+        elif kind == "clear":                      # Ctrl-U -> wipe the line
+            if inbuf: inbuf.clear(); out("\r\x1b[K")
+        elif kind == "eof":                        # Ctrl-D / Ctrl-Z on empty line
+            if not inbuf: return False
+        elif kind in ("up", "down") and history:   # recall older / newer line
+            if kind == "up":
+                if hidx == len(history): pending = "".join(inbuf)
+                if hidx > 0: hidx -= 1
+            elif hidx < len(history):
+                hidx += 1
+            recalled = pending if hidx == len(history) else history[hidx]
+            inbuf[:] = list(recalled)
+            out("\r\x1b[K" + recalled)
+        return True
+
+    _termios, _tty = termios, tty   # locals so the None-guards below narrow cleanly
+
+    # ---- POSIX raw mode: select() on stdin+socket, decode UTF-8 byte stream ----
+    if _termios is not None and _tty is not None and sys.stdin.isatty():
+        fd = sys.stdin.fileno()
+        old_attr = _termios.tcgetattr(fd)
+        in_carry = b""        # incomplete trailing UTF-8 bytes from a read
+        _tty.setcbreak(fd)    # char-at-a-time, no echo (we echo manually); Ctrl-C still signals
+        restore_term = lambda: _termios.tcsetattr(fd, _termios.TCSADRAIN, old_attr)
+        def _ask_key_raw(prompt):
             out(prompt)
-            try: ans = sys.stdin.readline().strip().lower()
-            except Exception: ans = ""
-            return ans[:1]
-        ask_key = _ask_key_cooked
+            try: ch = os.read(fd, 1)        # single keypress, no Enter needed
+            except OSError: ch = b""
+            ans = ch.decode("latin-1", "replace")
+            out((ans if ans.isprintable() else "") + "\r\n")
+            return ans.lower()
+        ask_key = _ask_key_raw
+        def feed(s):
+            """Translate a decoded keystroke string (incl. ANSI escapes) to key
+            events. Returns False to quit the shell."""
+            j = 0
+            while j < len(s):
+                c = s[j]
+                if c in ("\r", "\n"):
+                    if handle_key("enter") is False: return False
+                elif c in ("\x7f", "\x08"):
+                    handle_key("backspace")
+                elif c == "\x04":
+                    if handle_key("eof") is False: return False
+                elif c == "\x15":
+                    handle_key("clear")
+                elif c == "\x1b":                  # escape seq: Up/Down recall history
+                    j += 1; final = ""
+                    if j < len(s) and s[j] == "[":
+                        j += 1
+                        while j < len(s) and not ("@" <= s[j] <= "~"): j += 1
+                        if j < len(s): final = s[j]
+                    if final == "A": handle_key("up")
+                    elif final == "B": handle_key("down")
+                elif c >= " ":
+                    handle_key("text", c)
+                j += 1                             # other control chars: ignored
+            return True
         try:
             while True:
-                sock = mud.s        # re-read each loop: a transfer may have reconnected
+                sk = mud.s              # re-read each loop: a transfer may have reconnected
                 try:
-                    r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
+                    r, _, _ = select.select([sys.stdin, sk], [], [], 0.3)
                 except (ValueError, OSError):
                     out("\r\n*** MUD connection lost. ***\r\n"); break
-                if sock in r:
-                    data = sock.recv(65536)
-                    if not data: out("\r\n*** MUD closed the connection. ***\r\n"); break
-                    out(mud._strip_iac(data))
+                if sk in r and not pump_socket(sk): break
                 if sys.stdin in r:
-                    line = sys.stdin.readline()
-                    if not line: break                 # Ctrl-D / EOF
-                    if not handle_line(line.rstrip("\n")): break
+                    chunk = os.read(fd, 4096)
+                    if not chunk: break                # EOF
+                    buf = in_carry + chunk
+                    hold = _utf8_incomplete_tail(buf)
+                    in_carry = buf[len(buf) - hold:] if hold else b""
+                    s = (buf[:len(buf) - hold] if hold else buf).decode("utf-8", "replace")
+                    if feed(s) is False: break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try: restore_term()          # always restore the terminal, even on error
+            except Exception: pass
+            out("\r\nDisconnected.\r\n"); mud.close()
+        return
+
+    # ---- Windows raw mode: select() on the socket only (Windows can't select a
+    # console handle), poll the keyboard via msvcrt. Works in Windows Terminal,
+    # WARP, PowerShell, cmd — anywhere stdin is a real console. ----
+    if msvcrt is not None and sys.stdin.isatty():
+        # Enable ANSI escapes so our \r\x1b[K redraws render, and make stdout
+        # UTF-8 so non-ASCII (Norwegian, CJK) echoes and prints intact.
+        try:
+            import ctypes
+            kern = ctypes.windll.kernel32               # type: ignore[attr-defined]  (Windows-only)
+            hcon = kern.GetStdHandle(-11)               # STD_OUTPUT_HANDLE
+            cmode = ctypes.c_uint32()
+            if kern.GetConsoleMode(hcon, ctypes.byref(cmode)):
+                kern.SetConsoleMode(hcon, cmode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:
+            pass
+        try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception: pass
+        def _ask_key_win(prompt):
+            out(prompt)
+            try: ch = msvcrt.getwch()       # type: ignore[union-attr]  single keypress, no Enter
+            except Exception: ch = ""
+            if ch in ("\x00", "\xe0"):      # arrow/function key: drop the trailing code
+                try: msvcrt.getwch()        # type: ignore[union-attr]
+                except Exception: pass
+                ch = ""
+            out((ch if ch.isprintable() else "") + "\r\n")
+            return ch.lower()
+        ask_key = _ask_key_win
+        try:
+            while True:
+                sk = mud.s              # re-read each loop: a transfer may have reconnected
+                try:
+                    r, _, _ = select.select([sk], [], [], 0.05)
+                except (ValueError, OSError):
+                    out("\r\n*** MUD connection lost. ***\r\n"); break
+                if r and not pump_socket(sk): break
+                quit_now = False
+                while msvcrt.kbhit():               # type: ignore[union-attr]  drain keyboard, no block
+                    ch = msvcrt.getwch()            # type: ignore[union-attr]
+                    if ch in ("\x00", "\xe0"):      # arrow / function key prefix
+                        code = msvcrt.getwch()      # type: ignore[union-attr]
+                        if code == "H": handle_key("up")
+                        elif code == "P": handle_key("down")
+                    elif ch in ("\r", "\n"):
+                        if handle_key("enter") is False: quit_now = True; break
+                    elif ch in ("\x08", "\x7f"):
+                        handle_key("backspace")
+                    elif ch == "\x03":              # Ctrl-C
+                        raise KeyboardInterrupt
+                    elif ch in ("\x04", "\x1a"):    # Ctrl-D / Ctrl-Z on empty line -> quit
+                        if handle_key("eof") is False: quit_now = True; break
+                    elif ch == "\x15":
+                        handle_key("clear")
+                    elif ch >= " ":
+                        handle_key("text", ch)
+                if quit_now: break
         except KeyboardInterrupt:
             pass
         finally:
             out("\r\nDisconnected.\r\n"); mud.close()
         return
 
-    assert _termios is not None and _tty is not None   # guaranteed by the guard above
-    fd = sys.stdin.fileno()
-    old_attr = _termios.tcgetattr(fd)
-    inbuf = []            # chars of the line being typed
-    in_carry = b""        # incomplete trailing UTF-8 bytes from a read
-    history = []          # submitted lines, oldest first (Up/Down recalls them)
-    hidx = 0              # cursor into history; == len(history) means the live line
-    pending = ""          # live line stashed when you start scrolling up
-    _tty.setcbreak(fd)    # char-at-a-time, no echo (we echo manually); Ctrl-C still signals
-    restore_term = lambda: _termios.tcsetattr(fd, _termios.TCSADRAIN, old_attr)
-    def _ask_key_raw(prompt):
+    # ---- Plain line-mode fallback: no raw terminal (pipes, redirected input). ----
+    def _ask_key_cooked(prompt):
         out(prompt)
-        try: ch = os.read(fd, 1)        # single keypress, no Enter needed
-        except OSError: ch = b""
-        ans = ch.decode("latin-1", "replace")
-        out((ans if ans.isprintable() else "") + "\r\n")
-        return ans.lower()
-    ask_key = _ask_key_raw
+        try: ans = sys.stdin.readline().strip().lower()
+        except Exception: ans = ""
+        return ans[:1]
+    ask_key = _ask_key_cooked
     try:
         while True:
-            sock = mud.s            # re-read each loop: a transfer may have reconnected
+            sk = mud.s              # re-read each loop: a transfer may have reconnected
             try:
-                r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
+                r, _, _ = select.select([sys.stdin, sk], [], [], 0.3)
             except (ValueError, OSError):
                 out("\r\n*** MUD connection lost. ***\r\n"); break
-            if sock in r:
-                data = sock.recv(65536)
-                if not data: out("\r\n*** MUD closed the connection. ***\r\n"); break
-                text = mud._strip_iac(data)
-                if text:
-                    if inbuf:                          # lift the input line out of the way…
-                        out("\r\x1b[K" + text + "".join(inbuf))   # …print output, redraw input
-                    else:
-                        out(text)
+            if sk in r and not pump_socket(sk): break
             if sys.stdin in r:
-                chunk = os.read(fd, 4096)
-                if not chunk: break                    # EOF
-                buf = in_carry + chunk
-                hold = _utf8_incomplete_tail(buf)
-                in_carry = buf[len(buf) - hold:] if hold else b""
-                s = (buf[:len(buf) - hold] if hold else buf).decode("utf-8", "replace")
-                j, quit_now = 0, False
-                while j < len(s):
-                    c = s[j]
-                    if c in ("\r", "\n"):              # submit the line
-                        out("\r\n")
-                        line = "".join(inbuf); inbuf.clear()
-                        if line and (not history or history[-1] != line):
-                            history.append(line)       # keep it; skip blanks + dups
-                        hidx = len(history); pending = ""   # back to a fresh live line
-                        if not handle_line(line): quit_now = True; break
-                    elif c in ("\x7f", "\x08"):        # backspace / delete
-                        if inbuf: inbuf.pop(); out("\b \b")
-                    elif c == "\x04":                  # Ctrl-D on empty line -> quit
-                        if not inbuf: quit_now = True; break
-                    elif c == "\x15":                  # Ctrl-U -> clear the line
-                        if inbuf: inbuf.clear(); out("\r\x1b[K")
-                    elif c == "\x1b":                  # escape seq: Up/Down recall history
-                        j += 1
-                        final = ""
-                        if j < len(s) and s[j] == "[":
-                            j += 1
-                            while j < len(s) and not ("@" <= s[j] <= "~"):
-                                j += 1
-                            if j < len(s): final = s[j]
-                        if final in ("A", "B") and history:
-                            if final == "A":           # up -> older line
-                                if hidx == len(history): pending = "".join(inbuf)
-                                if hidx > 0: hidx -= 1
-                            else:                      # down -> newer line
-                                if hidx < len(history): hidx += 1
-                            recalled = pending if hidx == len(history) else history[hidx]
-                            inbuf[:] = list(recalled)
-                            out("\r\x1b[K" + recalled)
-                    elif c >= " ":                     # printable (incl. Unicode) -> echo
-                        inbuf.append(c); out(c)
-                    j += 1                             # other control chars: ignored
-                if quit_now: break
+                line = sys.stdin.readline()
+                if not line: break                 # Ctrl-D / EOF
+                if not handle_line(line.rstrip("\n")): break
     except KeyboardInterrupt:
         pass
     finally:
-        try: restore_term()          # always restore the terminal, even on error
-        except Exception: pass
-        out("\r\nDisconnected.\r\n")
-        mud.close()
+        out("\r\nDisconnected.\r\n"); mud.close()
 
 def do_where_banner(state):
     return f"  local : {state['local']}\r\n  remote: {state['rcwd']}\r\n"
