@@ -898,6 +898,9 @@ def cmd_connect(args):
     old_attr = _termios.tcgetattr(fd)
     inbuf = []            # chars of the line being typed
     in_carry = b""        # incomplete trailing UTF-8 bytes from a read
+    history = []          # submitted lines, oldest first (Up/Down recalls them)
+    hidx = 0              # cursor into history; == len(history) means the live line
+    pending = ""          # live line stashed when you start scrolling up
     _tty.setcbreak(fd)    # char-at-a-time, no echo (we echo manually); Ctrl-C still signals
     restore_term = lambda: _termios.tcsetattr(fd, _termios.TCSADRAIN, old_attr)
     def _ask_key_raw(prompt):
@@ -937,6 +940,9 @@ def cmd_connect(args):
                     if c in ("\r", "\n"):              # submit the line
                         out("\r\n")
                         line = "".join(inbuf); inbuf.clear()
+                        if line and (not history or history[-1] != line):
+                            history.append(line)       # keep it; skip blanks + dups
+                        hidx = len(history); pending = ""   # back to a fresh live line
                         if not handle_line(line): quit_now = True; break
                     elif c in ("\x7f", "\x08"):        # backspace / delete
                         if inbuf: inbuf.pop(); out("\b \b")
@@ -944,12 +950,23 @@ def cmd_connect(args):
                         if not inbuf: quit_now = True; break
                     elif c == "\x15":                  # Ctrl-U -> clear the line
                         if inbuf: inbuf.clear(); out("\r\x1b[K")
-                    elif c == "\x1b":                  # swallow an escape seq (arrow keys…)
+                    elif c == "\x1b":                  # escape seq: Up/Down recall history
                         j += 1
+                        final = ""
                         if j < len(s) and s[j] == "[":
                             j += 1
                             while j < len(s) and not ("@" <= s[j] <= "~"):
                                 j += 1
+                            if j < len(s): final = s[j]
+                        if final in ("A", "B") and history:
+                            if final == "A":           # up -> older line
+                                if hidx == len(history): pending = "".join(inbuf)
+                                if hidx > 0: hidx -= 1
+                            else:                      # down -> newer line
+                                if hidx < len(history): hidx += 1
+                            recalled = pending if hidx == len(history) else history[hidx]
+                            inbuf[:] = list(recalled)
+                            out("\r\x1b[K" + recalled)
                     elif c >= " ":                     # printable (incl. Unicode) -> echo
                         inbuf.append(c); out(c)
                     j += 1                             # other control chars: ignored
