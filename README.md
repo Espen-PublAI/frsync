@@ -75,8 +75,18 @@ Change it any time with `/lcd <dir>`, or start elsewhere with
 
 ### Scriptable commands
 
-For automation and one-shot transfers, call the subcommands directly. Every
-write is **verified** (length + checksum) after upload.
+For automation and one-shot transfers, call the subcommands directly. Each takes
+a **local** path and a **server** path; either can be a single file or a
+directory (directories sync recursively). Every `push`/`pull` is **verified**
+(size + checksum) on both ends.
+
+| Command  | Direction          | What it does                                                 |
+|----------|--------------------|--------------------------------------------------------------|
+| `status` | compare            | Show what differs between local and MUD. Changes nothing.    |
+| `push`   | local → MUD        | Upload, verified. Asks before writing.                       |
+| `pull`   | MUD → local        | Download, verified.                                          |
+| `watch`  | local → MUD (live) | Auto-upload files as you save/drop them into a folder.       |
+| `mirror` | MUD → local (bulk) | Download whole subtrees for a local working copy. Resumable. |
 
 ```bash
 # compare a local area against the MUD, change nothing
@@ -95,8 +105,29 @@ python3 frsync.py mirror ./MUD /std /d /w/<creator>
 python3 frsync.py watch ./myarea /w/<creator>/myarea
 ```
 
-Handy global flags: `--char NAME` (skip the name prompt), `--ext .c,.h`
-(directories: only these extensions), `--dry-run`, `--delete`, `-y`/`--yes`.
+**Typical workflow:**
+
+```bash
+python3 frsync.py pull   /w/<creator>/myarea ./myarea   # get the current version
+# …edit files locally in your editor…
+python3 frsync.py status ./myarea /w/<creator>/myarea   # check what changed
+python3 frsync.py push   ./myarea /w/<creator>/myarea   # ship it (verified)
+```
+
+…or just leave `watch` running and every save uploads automatically.
+
+**Flags:**
+
+| Flag               | Meaning                                                              |
+|--------------------|----------------------------------------------------------------------|
+| `--char NAME`      | Creator name (skip the prompt).                                      |
+| `--ext .c,.h`      | Only these file types (directory syncs).                             |
+| `--dry-run`        | Show what *would* happen; change nothing.                            |
+| `-y` / `--yes`     | Don't ask for confirmation (for scripts).                            |
+| `--delete`         | **push only:** remove server files missing locally (off by default).  |
+| `--include-backup` | **mirror only:** include old `BACKUP/`/`ATTIC/` archives (skipped by default). |
+| `--rewalk`         | **mirror only:** re-list the tree instead of using the cached manifest. |
+
 Run `python3 frsync.py --help` for the complete list.
 
 The same operations are wrapped as Make targets:
@@ -114,6 +145,9 @@ make install            # installs `frsync` to /usr/local/bin (set PREFIX= to ch
 frsync --help
 make uninstall
 ```
+
+`frsync.py` is a single standard-library file with no dependencies — you can
+also just copy or paste it anywhere and run it.
 
 ---
 
@@ -217,6 +251,17 @@ protocol. Reads use `read_bytes` (chunked, since it's capped per call); writes
 use `write_file` and are verified after the fact with a length + CRC check.
 Everything you can do is bounded by your in-game permissions — FRsync grants no
 access you don't already have as a builder.
+
+A few things worth knowing:
+
+- **Nothing on the server is deleted** unless you explicitly pass `push --delete`.
+- Every `push`/`pull` is **verified** by comparing size + checksum on both ends.
+- `mirror` is **resumable** — stop any time and re-run; it skips what's already
+  downloaded (the file list is cached in a `.frmanifest_*.tsv`).
+- Read-protected dirs (player accounts, `/secure`, server scripts) are **skipped
+  cleanly** and listed in `.frsync_skipped.txt`.
+- It **auto-reconnects** if the MUD drops the link, and streams file contents in
+  safe chunks (the driver drops very long input lines).
 
 ---
 
