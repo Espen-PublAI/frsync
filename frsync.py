@@ -666,14 +666,25 @@ def expand_remote_arg(mud, pattern, rcwd):
     names = [n for n, s in mud.listdir(rdir) if s != -2]    # files only, skip dirs
     return [f"{rdir.rstrip('/')}/{n}" for n in sorted(fnmatch.filter(names, base))]
 
+def human_size(n):
+    return f"{n/1024:.1f}K" if n >= 1024 else f"{n}B"
+
 def render_progress(label, done, total, width=22):
     """A single-line progress bar that overwrites itself via leading '\\r'.
     The caller clears the line (\\r\\x1b[K) and prints the result when done."""
     frac = 1.0 if total <= 0 else min(max(done, 0) / total, 1.0)
     fill = int(frac * width)
     bar = "█" * fill + "░" * (width - fill)
-    human = lambda n: f"{n/1024:.1f}K" if n >= 1024 else f"{n}B"
-    return f"\r  {label[:18]:<18} [{bar}] {int(frac*100):3d}%  {human(done)}/{human(total)}"
+    return f"\r  {label[:18]:<18} [{bar}] {int(frac*100):3d}%  {human_size(done)}/{human_size(total)}"
+
+def render_batch_bar(done, total, idx, count, label, width=22):
+    """One overall progress bar for a whole multi-file transfer: total bytes
+    across every file, plus which file (idx/count) is moving right now."""
+    frac = 1.0 if total <= 0 else min(max(done, 0) / total, 1.0)
+    fill = int(frac * width)
+    bar = "█" * fill + "░" * (width - fill)
+    return (f"\r  [{bar}] {int(frac*100):3d}%  ({idx}/{count}) "
+            f"{label[:16]:<16} {human_size(done)}/{human_size(total)}")
 
 def cli_progress(label):
     """A progress callback for the scriptable commands: draws an in-place bar on
@@ -705,14 +716,27 @@ def cmd_connect(args):
     state = {"local": local, "rcwd": home or "/"}
     made = set()
 
-    # Overwrite confirmation. Each terminal mode installs its own prompt fn
-    # below (single keypress in raw mode, a line read in the fallback).
-    confirm_overwrite = None
-    def overwrite_ok(what):
-        """Ask before clobbering an existing destination; default No. Returns
-        True to proceed. With no interactive prompt available, preserves the
-        old always-overwrite behaviour."""
-        return confirm_overwrite(what) if confirm_overwrite else True
+    # Overwrite confirmation. Each terminal mode installs its own key reader
+    # below (single keypress in raw mode, a line read in the fallback) that
+    # returns one lowercased char: y / n / a(ll) / q(uit-rest).
+    ask_key = None
+    def decide_overwrites(items, exists, name):
+        """Walk `items`; for any whose destination already exists, ask whether
+        to overwrite — with 'a' = yes-to-all and 'q' = skip-all-remaining, so a
+        big batch is one keypress. Returns (to_transfer, skipped)."""
+        to_do, skipped, mode = [], [], None
+        for x in items:
+            if not exists(x):
+                to_do.append(x); continue
+            if mode == "all":  to_do.append(x); continue
+            if mode == "none": skipped.append(x); continue
+            ans = ask_key(f"\r\n  {name(x)} already exists — overwrite? "
+                          f"[y]es [n]o [a]ll [q]uit ") if ask_key else "y"
+            if   ans == "a": mode = "all";  to_do.append(x)
+            elif ans == "q": mode = "none"; skipped.append(x)
+            elif ans == "y": to_do.append(x)
+            else:            skipped.append(x)        # n / empty / anything else
+        return to_do, skipped
 
     HELP = (
         "\r\n"
@@ -755,40 +779,64 @@ def cmd_connect(args):
             state["rcwd"] = resolve_remote(a[0], state["rcwd"]) if a else home
             out(f"\r\n  remote dir = {state['rcwd']}\r\n")
         elif cmd in ("/download", "/get"):
-            if not a: out("\r\n  usage: /download <file|glob> [..]   (e.g. *.c)\r\n")
+            if not a: out("\r\n  usage: /download <file|glob> [..]   (e.g. *.c)\r\n"); return True
+            # collect every matched remote file + its size
+            sized = []
             for pat in a:
-                targets = expand_remote_arg(mud, pat, state["rcwd"])
-                if not targets: out(f"\r\n  ✗ {pat}: no remote files match\r\n"); continue
-                for rp in targets:
+                t = expand_remote_arg(mud, pat, state["rcwd"])
+                if not t: out(f"\r\n  ✗ {pat}: no remote files match\r\n")
+                for rp in t:
                     sz = mud.file_size(rp)
                     if sz < 0: out(f"\r\n  ✗ {os.path.basename(rp)}: not found on MUD\r\n"); continue
-                    lp = os.path.join(state["local"], os.path.basename(rp))
-                    if os.path.exists(lp) and not overwrite_ok(
-                            f"{os.path.basename(lp)} already exists locally — overwrite?"):
-                        out(f"\r\n  • skipped {os.path.basename(rp)}\r\n"); continue
-                    base = os.path.basename(rp)
-                    out("\r\n")
-                    data = mud.read_file_bytes(rp, sz, progress=lambda d, t: out(render_progress(base, d, t)))
-                    open(lp, "wb").write(data)
-                    ok = len(data) == sz
-                    out(f"\r\x1b[K  {'↓' if ok else '✗'} {base} ({len(data)} b) -> {lp}\r\n")
+                    sized.append((rp, sz))
+            if not sized: return True
+            lp_of = lambda it: os.path.join(state["local"], os.path.basename(it[0]))
+            to_do, skipped = decide_overwrites(
+                sized, lambda it: os.path.exists(lp_of(it)), lambda it: os.path.basename(it[0]))
+            for it in skipped: out(f"\r\n  • skipped {os.path.basename(it[0])}")
+            if not to_do: out("\r\n"); return True
+            total = sum(sz for _, sz in to_do); done = 0
+            out("\r\n")
+            for idx, (rp, sz) in enumerate(to_do, 1):
+                base = os.path.basename(rp)
+                data = mud.read_file_bytes(rp, sz, progress=lambda d, t, b=base, i=idx:
+                                           out(render_batch_bar(done + d, total, i, len(to_do), b)))
+                open(lp_of((rp, sz)), "wb").write(data)
+                done += len(data)
+            out(f"\r\x1b[K  ↓ {len(to_do)} file(s), {human_size(done)} -> {state['local']}")
+            if skipped: out(f"   ·  {len(skipped)} skipped")
+            out("\r\n")
         elif cmd in ("/upload", "/put"):
-            if not a: out("\r\n  usage: /upload <file|glob> [..]   (e.g. *.c)\r\n")
+            if not a: out("\r\n  usage: /upload <file|glob> [..]   (e.g. *.c)\r\n"); return True
+            # collect every matched local file
+            files = []
             for pat in a:
-                matches = expand_local_arg(state["local"], pat)
-                if not matches: out(f"\r\n  ✗ {pat}: no local files match\r\n"); continue
-                for lp in matches:
+                m = expand_local_arg(state["local"], pat)
+                if not m: out(f"\r\n  ✗ {pat}: no local files match\r\n")
+                for lp in m:
                     if not os.path.isfile(lp): out(f"\r\n  ✗ {os.path.basename(lp)}: no such local file\r\n"); continue
-                    rp = resolve_remote(os.path.basename(lp), state["rcwd"])
-                    if mud.file_size(rp) >= 0 and not overwrite_ok(
-                            f"{os.path.basename(rp)} already exists on the MUD — overwrite?"):
-                        out(f"\r\n  • skipped {os.path.basename(lp)}\r\n"); continue
-                    base = os.path.basename(lp)
-                    out("\r\n")
-                    try:
-                        ok = push_one(mud, lp, rp, made, progress=lambda d, t: out(render_progress(base, d, t)))
-                        out(f"\r\x1b[K  {'↑' if ok else '✗'} {base} -> {rp}\r\n")
-                    except Exception as e: out(f"\r\x1b[K  ✗ {base}: {str(e)[:70]}\r\n")
+                    files.append(lp)
+            if not files: return True
+            rp_of = lambda lp: resolve_remote(os.path.basename(lp), state["rcwd"])
+            to_do, skipped = decide_overwrites(
+                files, lambda lp: mud.file_size(rp_of(lp)) >= 0, os.path.basename)
+            for lp in skipped: out(f"\r\n  • skipped {os.path.basename(lp)}")
+            if not to_do: out("\r\n"); return True
+            sizes = {lp: len(local_norm(open(lp, "rb").read())) for lp in to_do}
+            total = sum(sizes.values()); done = 0; ok_count = 0
+            out("\r\n")
+            for idx, lp in enumerate(to_do, 1):
+                base = os.path.basename(lp)
+                try:
+                    if push_one(mud, lp, rp_of(lp), made, progress=lambda d, t, b=base, i=idx:
+                                out(render_batch_bar(done + d, total, i, len(to_do), b))):
+                        ok_count += 1
+                except Exception as e:
+                    out(f"\r\x1b[K  ✗ {base}: {str(e)[:60]}\r\n")
+                done += sizes[lp]
+            out(f"\r\x1b[K  ↑ {ok_count}/{len(to_do)} file(s), {human_size(total)} -> {state['rcwd']}")
+            if skipped: out(f"   ·  {len(skipped)} skipped")
+            out("\r\n")
         else:
             out(f"\r\n  unknown /command: {cmd}  (try /help)\r\n")
         return True
@@ -815,12 +863,12 @@ def cmd_connect(args):
     # terminal; falls back to plain line mode otherwise (pipes, Windows).
     _termios, _tty = termios, tty   # locals so the None-guard below narrows cleanly
     if _termios is None or _tty is None or not sys.stdin.isatty():
-        def _confirm_cooked(what):
-            out(f"\r\n  {what} [y/N] ")
+        def _ask_key_cooked(prompt):
+            out(prompt)
             try: ans = sys.stdin.readline().strip().lower()
             except Exception: ans = ""
-            return ans in ("y", "yes")
-        confirm_overwrite = _confirm_cooked
+            return ans[:1]
+        ask_key = _ask_key_cooked
         try:
             while True:
                 r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
@@ -845,14 +893,14 @@ def cmd_connect(args):
     in_carry = b""        # incomplete trailing UTF-8 bytes from a read
     _tty.setcbreak(fd)    # char-at-a-time, no echo (we echo manually); Ctrl-C still signals
     restore_term = lambda: _termios.tcsetattr(fd, _termios.TCSADRAIN, old_attr)
-    def _confirm_raw(what):
-        out(f"\r\n  {what} [y/N] ")
+    def _ask_key_raw(prompt):
+        out(prompt)
         try: ch = os.read(fd, 1)        # single keypress, no Enter needed
         except OSError: ch = b""
         ans = ch.decode("latin-1", "replace")
         out((ans if ans.isprintable() else "") + "\r\n")
-        return ans in ("y", "Y")
-    confirm_overwrite = _confirm_raw
+        return ans.lower()
+    ask_key = _ask_key_raw
     try:
         while True:
             r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
