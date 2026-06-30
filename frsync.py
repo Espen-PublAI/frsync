@@ -34,7 +34,7 @@ OPTIONS
 Password: read from $FRPASS if set, otherwise prompted (never stored).
 Pure Python 3 standard library — one file, share it freely.
 """
-import argparse, fnmatch, getpass, glob, os, re, select, socket, sys, time, zlib
+import argparse, fnmatch, getpass, glob, os, queue, re, select, socket, sys, threading, time, zlib
 try:
     import termios, tty          # POSIX-only; absent on Windows
 except ImportError:
@@ -748,6 +748,77 @@ def pinned_batch(jobs, arrow, dest, write, ask_key=None, bar=True):
     write(msg + nl)
     return st
 
+def _enable_windows_console():
+    """On Windows, turn on ANSI escape processing (so our \\r\\x1b[K line redraws
+    and the progress bars render instead of printing literal `←[K`) and switch
+    stdout to UTF-8 (so non-ASCII — Norwegian, CJK — echoes and prints intact).
+    A no-op on POSIX, and harmless if already enabled. Called once at startup so
+    EVERY command gets working bars, not just the interactive `connect`."""
+    if msvcrt is None:
+        return
+    try:
+        import ctypes
+        kern = ctypes.windll.kernel32                   # type: ignore[attr-defined]  (Windows-only)
+        hcon = kern.GetStdHandle(-11)                   # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kern.GetConsoleMode(hcon, ctypes.byref(mode)):
+            kern.SetConsoleMode(hcon, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+    try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception: pass
+
+class LineEditor:
+    """The pinned input line for the interactive shell: holds the line being
+    typed plus Up/Down history, echoes edits, and submits completed lines.
+
+    Shared by the POSIX (termios) and Windows (msvcrt) raw-mode loops, which
+    differ only in how they READ keys — both translate a keystroke into one
+    `key()` call. The cooked fallback uses only `echo_output` (its buffer stays
+    empty) and submits whole lines itself."""
+    def __init__(self, write, submit):
+        self._write = write       # out(str) -> None
+        self._submit = submit     # handle_line(str) -> bool  (False = quit)
+        self.buf = []             # chars of the line being typed
+        self.history = []         # submitted lines, oldest first (Up/Down recalls)
+        self.hidx = 0             # cursor into history; == len means the live line
+        self.pending = ""         # live line stashed while scrolling up
+
+    def echo_output(self, text):
+        """Print async MUD output, keeping the typed line pinned at the bottom."""
+        if self.buf:
+            self._write("\r\x1b[K" + text + "".join(self.buf))  # lift input, print, redraw
+        else:
+            self._write(text)
+
+    def key(self, kind, ch=""):
+        """Apply one logical key event to the line. Returns False to quit."""
+        if kind == "text":                          # printable (incl. Unicode) -> echo
+            self.buf.append(ch); self._write(ch)
+        elif kind == "enter":                       # submit the line
+            self._write("\r\n")
+            line = "".join(self.buf); self.buf.clear()
+            if line and (not self.history or self.history[-1] != line):
+                self.history.append(line)           # keep it; skip blanks + dups
+            self.hidx = len(self.history); self.pending = ""   # back to a fresh live line
+            return self._submit(line)
+        elif kind == "backspace":
+            if self.buf: self.buf.pop(); self._write("\b \b")
+        elif kind == "clear":                       # Ctrl-U -> wipe the line
+            if self.buf: self.buf.clear(); self._write("\r\x1b[K")
+        elif kind == "eof":                         # Ctrl-D / Ctrl-Z on empty line
+            if not self.buf: return False
+        elif kind in ("up", "down") and self.history:   # recall older / newer line
+            if kind == "up":
+                if self.hidx == len(self.history): self.pending = "".join(self.buf)
+                if self.hidx > 0: self.hidx -= 1
+            elif self.hidx < len(self.history):
+                self.hidx += 1
+            recalled = self.pending if self.hidx == len(self.history) else self.history[self.hidx]
+            self.buf[:] = list(recalled)
+            self._write("\r\x1b[K" + recalled)
+        return True
+
 def cmd_connect(args):
     """Interactive MUD shell: you're connected like telnet (all normal MUD and
     creator commands go straight to the server), plus local /commands to move
@@ -865,13 +936,11 @@ def cmd_connect(args):
     out("\r\n" + mud.drain(1.0))
 
     # Keep what you're typing pinned at the bottom and redraw it when async MUD
-    # output arrives, so input and server text never interleave. Two raw-mode
-    # paths share the line editor below — POSIX (termios) and Windows (msvcrt) —
-    # and a plain line-mode fallback covers pipes / non-terminals.
-    inbuf = []            # chars of the line being typed
-    history = []          # submitted lines, oldest first (Up/Down recalls them)
-    hidx = 0              # cursor into history; == len(history) means the live line
-    pending = ""          # live line stashed when you start scrolling up
+    # output arrives, so input and server text never interleave. The line editor
+    # (input buffer + Up/Down history) is shared by both raw-mode loops below —
+    # POSIX (termios) and Windows (msvcrt); the cooked fallback uses only its
+    # echo_output and submits whole lines directly.
+    editor = LineEditor(out, handle_line)
 
     def pump_socket(sk):
         """Print pending MUD output and redraw the pinned input. False = closed."""
@@ -880,37 +949,7 @@ def cmd_connect(args):
             out("\r\n*** MUD closed the connection. ***\r\n"); return False
         text = mud._strip_iac(data)
         if text:
-            if inbuf: out("\r\x1b[K" + text + "".join(inbuf))  # lift input, print, redraw
-            else:     out(text)
-        return True
-
-    def handle_key(kind, ch=""):
-        """Apply one logical key event to the input line. Returns False to quit."""
-        nonlocal hidx, pending
-        if kind == "text":                         # printable (incl. Unicode) -> echo
-            inbuf.append(ch); out(ch)
-        elif kind == "enter":                      # submit the line
-            out("\r\n")
-            line = "".join(inbuf); inbuf.clear()
-            if line and (not history or history[-1] != line):
-                history.append(line)               # keep it; skip blanks + dups
-            hidx = len(history); pending = ""       # back to a fresh live line
-            return handle_line(line)
-        elif kind == "backspace":
-            if inbuf: inbuf.pop(); out("\b \b")
-        elif kind == "clear":                      # Ctrl-U -> wipe the line
-            if inbuf: inbuf.clear(); out("\r\x1b[K")
-        elif kind == "eof":                        # Ctrl-D / Ctrl-Z on empty line
-            if not inbuf: return False
-        elif kind in ("up", "down") and history:   # recall older / newer line
-            if kind == "up":
-                if hidx == len(history): pending = "".join(inbuf)
-                if hidx > 0: hidx -= 1
-            elif hidx < len(history):
-                hidx += 1
-            recalled = pending if hidx == len(history) else history[hidx]
-            inbuf[:] = list(recalled)
-            out("\r\x1b[K" + recalled)
+            editor.echo_output(text)
         return True
 
     _termios, _tty = termios, tty   # locals so the None-guards below narrow cleanly
@@ -937,23 +976,23 @@ def cmd_connect(args):
             while j < len(s):
                 c = s[j]
                 if c in ("\r", "\n"):
-                    if handle_key("enter") is False: return False
+                    if editor.key("enter") is False: return False
                 elif c in ("\x7f", "\x08"):
-                    handle_key("backspace")
+                    editor.key("backspace")
                 elif c == "\x04":
-                    if handle_key("eof") is False: return False
+                    if editor.key("eof") is False: return False
                 elif c == "\x15":
-                    handle_key("clear")
+                    editor.key("clear")
                 elif c == "\x1b":                  # escape seq: Up/Down recall history
                     j += 1; final = ""
                     if j < len(s) and s[j] == "[":
                         j += 1
                         while j < len(s) and not ("@" <= s[j] <= "~"): j += 1
                         if j < len(s): final = s[j]
-                    if final == "A": handle_key("up")
-                    elif final == "B": handle_key("down")
+                    if final == "A": editor.key("up")
+                    elif final == "B": editor.key("down")
                 elif c >= " ":
-                    handle_key("text", c)
+                    editor.key("text", c)
                 j += 1                             # other control chars: ignored
             return True
         try:
@@ -984,19 +1023,9 @@ def cmd_connect(args):
     # console handle), poll the keyboard via msvcrt. Works in Windows Terminal,
     # WARP, PowerShell, cmd — anywhere stdin is a real console. ----
     if msvcrt is not None and sys.stdin.isatty():
-        # Enable ANSI escapes so our \r\x1b[K redraws render, and make stdout
-        # UTF-8 so non-ASCII (Norwegian, CJK) echoes and prints intact.
-        try:
-            import ctypes
-            kern = ctypes.windll.kernel32               # type: ignore[attr-defined]  (Windows-only)
-            hcon = kern.GetStdHandle(-11)               # STD_OUTPUT_HANDLE
-            cmode = ctypes.c_uint32()
-            if kern.GetConsoleMode(hcon, ctypes.byref(cmode)):
-                kern.SetConsoleMode(hcon, cmode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        except Exception:
-            pass
-        try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-        except Exception: pass
+        # ANSI escapes + UTF-8 stdout were enabled once at startup
+        # (_enable_windows_console), so the \r\x1b[K redraws and non-ASCII echo
+        # render correctly here without per-command setup.
         def _ask_key_win(prompt):
             out(prompt)
             try: ch = msvcrt.getwch()       # type: ignore[union-attr]  single keypress, no Enter
@@ -1021,20 +1050,20 @@ def cmd_connect(args):
                     ch = msvcrt.getwch()            # type: ignore[union-attr]
                     if ch in ("\x00", "\xe0"):      # arrow / function key prefix
                         code = msvcrt.getwch()      # type: ignore[union-attr]
-                        if code == "H": handle_key("up")
-                        elif code == "P": handle_key("down")
+                        if code == "H": editor.key("up")
+                        elif code == "P": editor.key("down")
                     elif ch in ("\r", "\n"):
-                        if handle_key("enter") is False: quit_now = True; break
+                        if editor.key("enter") is False: quit_now = True; break
                     elif ch in ("\x08", "\x7f"):
-                        handle_key("backspace")
+                        editor.key("backspace")
                     elif ch == "\x03":              # Ctrl-C
                         raise KeyboardInterrupt
                     elif ch in ("\x04", "\x1a"):    # Ctrl-D / Ctrl-Z on empty line -> quit
-                        if handle_key("eof") is False: quit_now = True; break
+                        if editor.key("eof") is False: quit_now = True; break
                     elif ch == "\x15":
-                        handle_key("clear")
+                        editor.key("clear")
                     elif ch >= " ":
-                        handle_key("text", ch)
+                        editor.key("text", ch)
                 if quit_now: break
         except KeyboardInterrupt:
             pass
@@ -1042,25 +1071,39 @@ def cmd_connect(args):
             out("\r\nDisconnected.\r\n"); mud.close()
         return
 
-    # ---- Plain line-mode fallback: no raw terminal (pipes, redirected input). ----
+    # ---- Plain line-mode fallback: no raw terminal (pipes, redirected input).
+    # stdin can't go through select() on Windows, so a daemon thread reads lines
+    # onto a queue while the main loop selects on the socket — one code path that
+    # works on both OSes. ----
+    line_q = queue.Queue()
+    def _stdin_reader():
+        try:
+            for line in sys.stdin:
+                line_q.put(line)
+        except Exception:
+            pass
+        line_q.put(None)                  # EOF sentinel
+    threading.Thread(target=_stdin_reader, daemon=True).start()
     def _ask_key_cooked(prompt):
         out(prompt)
-        try: ans = sys.stdin.readline().strip().lower()
-        except Exception: ans = ""
-        return ans[:1]
+        line = line_q.get()               # block for the next typed/piped line
+        return "" if line is None else line.strip().lower()[:1]
     ask_key = _ask_key_cooked
     try:
         while True:
             sk = mud.s              # re-read each loop: a transfer may have reconnected
             try:
-                r, _, _ = select.select([sys.stdin, sk], [], [], 0.3)
+                r, _, _ = select.select([sk], [], [], 0.1)
             except (ValueError, OSError):
                 out("\r\n*** MUD connection lost. ***\r\n"); break
-            if sk in r and not pump_socket(sk): break
-            if sys.stdin in r:
-                line = sys.stdin.readline()
-                if not line: break                 # Ctrl-D / EOF
-                if not handle_line(line.rstrip("\n")): break
+            if r and not pump_socket(sk): break
+            done = False
+            while True:                    # drain whatever the reader has queued
+                try: line = line_q.get_nowait()
+                except queue.Empty: break
+                if line is None: done = True; break        # stdin EOF
+                if not handle_line(line.rstrip("\n")): done = True; break
+            if done: break
     except KeyboardInterrupt:
         pass
     finally:
@@ -1364,6 +1407,7 @@ The MUD's permissions decide what you can read/write — exactly like in-game.
 """
 
 def main():
+    _enable_windows_console()   # ANSI + UTF-8 stdout for progress bars on Windows
     # Shared flags live on a parent parser so they're accepted in BOTH positions —
     # before the subcommand (`frsync -y push a b`) and after the positional args
     # (`frsync push a b -y`). argument_default=SUPPRESS means an unspecified flag
