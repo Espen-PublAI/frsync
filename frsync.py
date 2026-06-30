@@ -35,6 +35,10 @@ Password: read from $FRPASS if set, otherwise prompted (never stored).
 Pure Python 3 standard library — one file, share it freely.
 """
 import argparse, getpass, os, re, select, socket, sys, time, zlib
+try:
+    import termios, tty          # POSIX-only; absent on Windows
+except ImportError:
+    termios = tty = None
 
 DEF_HOST, DEF_PORT = "fr.hyssing.net", 4010
 PUSH_CMD_BUDGET = 900     # max chars in one `exec write_file(...)` line
@@ -704,33 +708,95 @@ def cmd_connect(args):
             out(f"\r\n  unknown /command: {cmd}  (try /help)\r\n")
         return True
 
+    def handle_line(line):
+        """Process one submitted input line. Returns False to quit the shell."""
+        # keep remote cwd in sync when you cd around the file tree
+        if line.strip().startswith("cd ") or line.strip() == "cd":
+            arg = line.strip()[2:].strip()
+            state["rcwd"] = (home if not arg else resolve_remote(arg, state["rcwd"]))
+        if line.startswith("/"):
+            return do_local(line)
+        mud.send_text(line)                    # UTF-8: allow typing Unicode
+        return True
+
     out(do_where_banner(state))
     # auto-look on entry so you can see where you are right away
     mud._flush(); mud.send("look")
     out("\r\n" + mud.drain(1.0))
     sock = mud.s
+
+    # Keep what you're typing pinned at the bottom and redraw it when async MUD
+    # output arrives, so input and server text never interleave. Needs a real
+    # terminal; falls back to plain line mode otherwise (pipes, Windows).
+    if termios is None or tty is None or not sys.stdin.isatty():
+        try:
+            while True:
+                r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
+                if sock in r:
+                    data = sock.recv(65536)
+                    if not data: out("\r\n*** MUD closed the connection. ***\r\n"); break
+                    out(mud._strip_iac(data))
+                if sys.stdin in r:
+                    line = sys.stdin.readline()
+                    if not line: break                 # Ctrl-D / EOF
+                    if not handle_line(line.rstrip("\n")): break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            out("\r\nDisconnected.\r\n"); mud.close()
+        return
+
+    fd = sys.stdin.fileno()
+    old_attr = termios.tcgetattr(fd)
+    inbuf = []            # chars of the line being typed
+    in_carry = b""        # incomplete trailing UTF-8 bytes from a read
+    tty.setcbreak(fd)     # char-at-a-time, no echo (we echo manually); Ctrl-C still signals
     try:
         while True:
             r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
             if sock in r:
                 data = sock.recv(65536)
                 if not data: out("\r\n*** MUD closed the connection. ***\r\n"); break
-                out(mud._strip_iac(data))
+                text = mud._strip_iac(data)
+                if text:
+                    if inbuf:                          # lift the input line out of the way…
+                        out("\r\x1b[K" + text + "".join(inbuf))   # …print output, redraw input
+                    else:
+                        out(text)
             if sys.stdin in r:
-                line = sys.stdin.readline()
-                if not line: break                      # Ctrl-D
-                line = line.rstrip("\n")
-                # keep remote cwd in sync when you cd around the file tree
-                if line.strip().startswith("cd ") or line.strip() == "cd":
-                    arg = line.strip()[2:].strip()
-                    state["rcwd"] = (home if not arg else resolve_remote(arg, state["rcwd"]))
-                if line.startswith("/"):
-                    if not do_local(line): break
-                else:
-                    mud.send_text(line)        # UTF-8: allow typing Unicode
+                chunk = os.read(fd, 4096)
+                if not chunk: break                    # EOF
+                buf = in_carry + chunk
+                hold = _utf8_incomplete_tail(buf)
+                in_carry = buf[len(buf) - hold:] if hold else b""
+                s = (buf[:len(buf) - hold] if hold else buf).decode("utf-8", "replace")
+                j, quit_now = 0, False
+                while j < len(s):
+                    c = s[j]
+                    if c in ("\r", "\n"):              # submit the line
+                        out("\r\n")
+                        line = "".join(inbuf); inbuf.clear()
+                        if not handle_line(line): quit_now = True; break
+                    elif c in ("\x7f", "\x08"):        # backspace / delete
+                        if inbuf: inbuf.pop(); out("\b \b")
+                    elif c == "\x04":                  # Ctrl-D on empty line -> quit
+                        if not inbuf: quit_now = True; break
+                    elif c == "\x15":                  # Ctrl-U -> clear the line
+                        if inbuf: inbuf.clear(); out("\r\x1b[K")
+                    elif c == "\x1b":                  # swallow an escape seq (arrow keys…)
+                        j += 1
+                        if j < len(s) and s[j] == "[":
+                            j += 1
+                            while j < len(s) and not ("@" <= s[j] <= "~"):
+                                j += 1
+                    elif c >= " ":                     # printable (incl. Unicode) -> echo
+                        inbuf.append(c); out(c)
+                    j += 1                             # other control chars: ignored
+                if quit_now: break
     except KeyboardInterrupt:
         pass
     finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
         out("\r\nDisconnected.\r\n")
         mud.close()
 
