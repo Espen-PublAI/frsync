@@ -1,0 +1,28 @@
+# --- Final Realms game content (NOT part of this tool, not ours to publish) ---
+MUD/
+drifting_forest/
+downloads/        # default landing folder for interactive /download
+*.log
+.frsync_done_dirs.txt
+.frsync_skipped.txt
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# --- Editor / OS cruft ---
+.DS_Store
+*~
+*.swp
+
+# --- Local tooling / secrets (never publish) ---
+.claude/
+.env

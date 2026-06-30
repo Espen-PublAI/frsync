@@ -1,0 +1,5 @@
+# The command-line tool (frsync.py) has NO dependencies — it's pure standard library.
+#
+# These are only needed for the MCP server (frsync_mcp.py):
+mcp        # exposes the MUD to Claude Code / any MCP client
+keyring    # cross-platform secure credential storage (Keychain / Credential Locker / Secret Service)
