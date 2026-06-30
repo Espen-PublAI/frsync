@@ -570,17 +570,18 @@ def cmd_push(args):
     if args.dry_run: mud.close(); return
     if not confirm(args, f"Push {len(todo)} file(s) to {args.remote}?"):
         mud.close(); return
-    made = set()
+    made = set(); jobs = []
     for rel in sorted(todo):
         lp = args.local if is_file else os.path.join(args.local, rel)
         rp = args.remote if is_file else f"{args.remote}/{rel}"
-        ensure_remote_dirs(mud, rp, made)
-        data = open(lp, "rb").read()
         label = rel or os.path.basename(rp)
-        mud.write_file_chunks(rp, data, progress=cli_progress(label))
-        ok = verify_remote(mud, rp, data)
-        cli_progress_clear()
-        print(f"  {'OK ' if ok else 'FAIL'}  push  {label}")
+        sz = len(local_norm(open(lp, "rb").read()))
+        def send(progress, lp=lp, rp=rp):
+            ensure_remote_dirs(mud, rp, made)
+            mud.write_file_chunks(rp, open(lp, "rb").read(), progress=progress)
+            return verify_remote(mud, rp, open(lp, "rb").read())
+        jobs.append({"base": label, "size": sz, "exists": False, "run": send})
+    pinned_batch(jobs, "↑", args.remote, write=_stdout_write, bar=sys.stdout.isatty())
     if args.delete and extra:
         for rel in sorted(extra):
             rp = f"{args.remote}/{rel}"
@@ -615,14 +616,16 @@ def cmd_pull(args):
         mud.close(); return
     if not confirm(args, f"Download {len(todo)} file(s) to {args.local}?"):
         mud.close(); return
+    jobs = []
     for rel, rp, lp, rs in todo:
         label = rel or os.path.basename(rp)
-        data = mud.read_file_bytes(rp, rs, progress=cli_progress(label))
-        os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
-        open(lp, "wb").write(data)
-        ok = (len(data) == rs)
-        cli_progress_clear()
-        print(f"  {'OK ' if ok else 'FAIL'}  pull  {label} ({len(data)} b)")
+        def fetch(progress, rp=rp, rs=rs, lp=lp):
+            data = mud.read_file_bytes(rp, rs, progress=progress)
+            os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
+            open(lp, "wb").write(data)
+            return len(data) == rs
+        jobs.append({"base": label, "size": rs, "exists": False, "run": fetch})
+    pinned_batch(jobs, "↓", args.local, write=_stdout_write, bar=sys.stdout.isatty())
     mud.close()
 
 def resolve_remote(arg, rcwd):
@@ -686,19 +689,60 @@ def render_batch_bar(done, total, idx, count, label, width=22):
     return (f"  [{bar}] {int(frac*100):3d}%  ({idx}/{count}) "
             f"{label[:16]:<16} {human_size(done)}/{human_size(total)}")
 
-def cli_progress(label):
-    """A progress callback for the scriptable commands: draws an in-place bar on
-    a real terminal, or None when stdout is redirected (keeps logs/CI clean)."""
-    if not sys.stdout.isatty():
-        return None
-    def cb(done, total):
-        sys.stdout.write(render_progress(label, done, total)); sys.stdout.flush()
-    return cb
+def _stdout_write(s):
+    sys.stdout.write(s); sys.stdout.flush()
 
-def cli_progress_clear():
-    """Erase the current bar line before printing a result (TTY only)."""
-    if sys.stdout.isatty():
-        sys.stdout.write("\r\x1b[K")
+def pinned_batch(jobs, arrow, dest, write, ask_key=None, bar=True):
+    """Run transfer `jobs` with ONE progress bar pinned at the bottom (when
+    `bar`), or plain per-file lines when `bar` is off (piped / non-tty). Used by
+    both the interactive shell and the scriptable push/pull.
+      jobs: list of {base, size, exists(bool), run(progress)->ok_bool}.
+      ask_key: optional overwrite key-asker (y/n/a=all-yes/s=no-all/q=quit);
+               None transfers everything without asking (caller already chose).
+    Returns the counts dict."""
+    st = {"total": sum(j["size"] for j in jobs), "done": 0,
+          "did": 0, "skip": 0, "fail": 0, "mode": None, "shown": False}
+    n = len(jobs); nl = "\r\n" if bar else "\n"
+    def draw(extra, label):
+        if not bar: return
+        idx = min(st["did"] + st["skip"] + st["fail"] + 1, n)
+        write("\r\x1b[K" + render_batch_bar(st["done"] + extra, st["total"], idx, n, label))
+        st["shown"] = True
+    def note(msg):                       # print a line above the bar
+        write(("\r\x1b[K" if st["shown"] else "") + msg + nl)
+        st["shown"] = False
+    def skip(base, size):
+        note(f"  • skipped {base}"); st["skip"] += 1; st["total"] -= size
+    aborted = False
+    for j in jobs:
+        base, size = j["base"], j["size"]
+        if ask_key and j["exists"] and st["mode"] != "all":
+            if st["mode"] == "none": skip(base, size); continue
+            if st["shown"]: write("\r\x1b[K"); st["shown"] = False   # clear bar to ask
+            ans = ask_key(f"  {base} already exists — overwrite? "
+                          f"[y]es [n]o [a]ll-yes [s]kip-all [q]uit ")
+            if ans == "q": aborted = True; break
+            if ans == "a": st["mode"] = "all"
+            elif ans == "s": st["mode"] = "none"; skip(base, size); continue
+            elif ans != "y": skip(base, size); continue
+        draw(0, base)
+        try:
+            ok = j["run"](lambda d, t, b=base: draw(d, b))
+        except Exception as e:
+            note(f"  ✗ {base}: {str(e)[:60]}"); st["fail"] += 1; continue
+        st["done"] += size
+        if ok:
+            st["did"] += 1
+            if not bar: note(f"  {arrow} {base} ({human_size(size)})")
+        else:
+            note(f"  ✗ {base}: verify failed"); st["fail"] += 1
+    if st["shown"]: write("\r\x1b[K")    # wipe the bar, leave the summary
+    msg = f"  {arrow} {st['did']} file(s), {human_size(st['done'])} -> {dest}"
+    if st["skip"]: msg += f"   ·  {st['skip']} skipped"
+    if st["fail"]: msg += f"   ·  {st['fail']} failed"
+    if aborted:    msg += "   ·  quit"
+    write(msg + nl)
+    return st
 
 def cmd_connect(args):
     """Interactive MUD shell: you're connected like telnet (all normal MUD and
@@ -721,46 +765,7 @@ def cmd_connect(args):
     # returns one lowercased char.
     ask_key = None
     def batch_transfer(jobs, arrow, dest):
-        """Run transfer `jobs` with ONE progress bar pinned at the bottom of the
-        screen; overwrite prompts and per-file notes scroll above it.
-        jobs: list of {base, size, exists(bool), run(progress)->ok}.
-        Overwrite keys: y / n / a=yes-to-all / s=no-to-all / q=quit."""
-        st = {"total": sum(j["size"] for j in jobs), "done": 0,
-              "did": 0, "skip": 0, "mode": None, "shown": False}
-        n = len(jobs)
-        def draw(extra, label):
-            idx = min(st["did"] + st["skip"] + 1, n)
-            out("\r\x1b[K" + render_batch_bar(st["done"] + extra, st["total"], idx, n, label))
-            st["shown"] = True
-        def note(msg):                       # print a line above the bar
-            out(("\r\x1b[K" if st["shown"] else "") + msg + "\r\n")
-            st["shown"] = False
-        def skip(base, size):
-            note(f"  • skipped {base}"); st["skip"] += 1; st["total"] -= size
-        aborted = False
-        for j in jobs:
-            base, size = j["base"], j["size"]
-            if j["exists"] and st["mode"] != "all":
-                if st["mode"] == "none":
-                    skip(base, size); continue
-                if st["shown"]: out("\r\x1b[K"); st["shown"] = False   # clear bar to ask
-                ans = ask_key(f"  {base} already exists — overwrite? "
-                              f"[y]es [n]o [a]ll-yes [s]kip-all [q]uit ") if ask_key else "y"
-                if ans == "q": aborted = True; break
-                if ans == "a": st["mode"] = "all"
-                elif ans == "s": st["mode"] = "none"; skip(base, size); continue
-                elif ans != "y": skip(base, size); continue
-            draw(0, base)
-            try:
-                j["run"](lambda d, t, b=base: draw(d, b))
-            except Exception as e:
-                note(f"  ✗ {base}: {str(e)[:60]}"); continue
-            st["done"] += size; st["did"] += 1
-        if st["shown"]: out("\r\x1b[K")       # wipe the bar, leave the summary
-        msg = f"  {arrow} {st['did']} file(s), {human_size(st['done'])} -> {dest}"
-        if st["skip"]: msg += f"   ·  {st['skip']} skipped"
-        if aborted:    msg += "   ·  quit"
-        out(msg + "\r\n")
+        pinned_batch(jobs, arrow, dest, write=out, ask_key=ask_key, bar=sys.stdout.isatty())
 
     HELP = (
         "\r\n"
