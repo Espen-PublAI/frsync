@@ -210,6 +210,23 @@ def test_stream_iac_inside_multibyte_char():
     assert got == "smør —" and carry == b"", (got, carry)
 
 
+def test_write_command_fits_line_budget():
+    # A full-size chunk plus its exec wrapper must stay within PUSH_CMD_BUDGET.
+    # If the wrapper reserve is too small (it once was 40, but the real wrapper
+    # is ~75), a short remote path yields a near-max chunk whose command line is
+    # truncated by the driver — the `return` is lost, _r is unused (a compile
+    # error), the write never lands, and write_file_chunks resends forever.
+    path = "/w/x/f.c"                       # short path -> largest chunk = worst case
+    text = ("a" * 6000)                     # packs into a full first chunk
+    budget = frsync.PUSH_CMD_BUDGET - len(path) - frsync.WRITE_WRAPPER_RESERVE
+    chunk, _n = next(iter(frsync.chunk_escaped(text, budget)))
+    for flag in (0, 1):                     # both flags produce the same length
+        cmd = (f'exec int _r=write_file("{path}", "{chunk}", {flag}); '
+               f'return "R"+"C"+sprintf("%d",_r)+"R"+"C";')
+        assert len(cmd) <= frsync.PUSH_CMD_BUDGET, \
+            f"wrapper reserve too small: command is {len(cmd)} > {frsync.PUSH_CMD_BUDGET}"
+
+
 # --------------------------------------------------------------------- runner
 class _FakeSelf:
     """Stand-in for a Mud instance: _write_once only touches _flush/send/expect."""
@@ -237,6 +254,7 @@ def main():
         ("latin-1 fallback on read",                lambda: test_latin1_fallback_on_read()),
         ("stream UTF-8 split across reads",         lambda: test_stream_utf8_split_across_reads()),
         ("stream IAC inside multibyte char",        lambda: test_stream_iac_inside_multibyte_char()),
+        ("write command fits line budget",          lambda: test_write_command_fits_line_budget()),
     ]
     failed = 0
     for name, fn in tests:

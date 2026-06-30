@@ -38,6 +38,13 @@ import argparse, getpass, os, re, select, socket, sys, time, zlib
 
 DEF_HOST, DEF_PORT = "fr.hyssing.net", 4010
 PUSH_CMD_BUDGET = 900     # max chars in one `exec write_file(...)` line
+# Fixed chars in the per-chunk exec wrapper, excluding <path> and <chunk>:
+#   exec int _r=write_file("<path>", "<chunk>", <flag>); return "R"+"C"+sprintf("%d",_r)+"R"+"C";
+# That boilerplate is ~75 chars; reserve a bit more so a full chunk can never
+# push the command past PUSH_CMD_BUDGET. An over-long line is truncated by the
+# driver — which lops off the `return`, leaving `_r` unused (a compile error),
+# so the write silently never lands and write_file_chunks resends forever.
+WRITE_WRAPPER_RESERVE = 90
 PULL_CHUNK      = 4096    # source bytes per read_bytes() call
 
 # ---------------------------------------------------------------- telnet layer
@@ -390,7 +397,7 @@ class Mud:
           anything else                  -> unknown state, rebuild from chunk 0
         (chunk 0's flag-1 truncate makes a rebuild clean)."""
         text = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("latin-1")
-        chunks = list(chunk_escaped(text, PUSH_CMD_BUDGET - len(path) - 40)) or [("", 0)]
+        chunks = list(chunk_escaped(text, PUSH_CMD_BUDGET - len(path) - WRITE_WRAPPER_RESERVE)) or [("", 0)]
         expected = 0          # bytes the file should hold after each landed chunk
         i, restarts = 0, 0
         while i < len(chunks):
