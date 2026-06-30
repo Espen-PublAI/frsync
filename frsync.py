@@ -389,7 +389,7 @@ class Mud:
         if m: return int(m.group(1))
         return None                                  # no result -> caller reconciles
 
-    def write_file_chunks(self, path, data: bytes):
+    def write_file_chunks(self, path, data: bytes, progress=None):
         """Upload `data` as a sequence of write_file() calls: chunk 0 overwrites
         (flag 1, truncating any old content), the rest append (flag 0).
 
@@ -402,14 +402,18 @@ class Mud:
         (chunk 0's flag-1 truncate makes a rebuild clean)."""
         text = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("latin-1")
         chunks = list(chunk_escaped(text, PUSH_CMD_BUDGET - len(path) - WRITE_WRAPPER_RESERVE)) or [("", 0)]
+        total = len(text)     # normalised byte count the file will hold when done
         expected = 0          # bytes the file should hold after each landed chunk
         i, restarts = 0, 0
+        if progress: progress(0, total)
         while i < len(chunks):
             ch, nbytes = chunks[i]
             flag = 1 if i == 0 else 0
             res = self._write_once(path, ch, flag)
             if res == 1:
-                expected += nbytes; i += 1; continue
+                expected += nbytes; i += 1
+                if progress: progress(expected, total)
+                continue
             if res == 0:
                 raise RuntimeError(f"write_file refused chunk {i} of {path} (returned 0)")
             # res is None -> uncertain. file_size() heals a silent session itself.
@@ -417,6 +421,7 @@ class Mud:
             size = fsz if fsz >= 0 else 0
             if size == expected + nbytes:            # landed; only the reply was lost
                 expected += nbytes; i += 1
+                if progress: progress(expected, total)
             elif size == expected:                   # nothing written; resend same chunk
                 continue
             else:                                    # unknown state -> rebuild from scratch
@@ -425,10 +430,12 @@ class Mud:
                         f"write_file: unrecoverable state for {path} "
                         f"(size={size}, expected~{expected} at chunk {i})")
                 restarts += 1; expected = 0; i = 0
+                if progress: progress(expected, total)
 
-    def read_file_bytes(self, path, size):
+    def read_file_bytes(self, path, size, progress=None):
         buf = bytearray()
         off = 0
+        if progress: progress(0, size)
         while off < size:
             n = min(PULL_CHUNK, size - off)
             code = (f'string c=read_bytes("{path}", {off}, {n}); string r=""; int i; '
@@ -436,6 +443,7 @@ class Mud:
                     f'return "M1"+"M2"+r+"M2"+"M1";')
             buf += self.exec_hex(code)
             off += n
+            if progress: progress(off, size)
         return bytes(buf)
 
 # ---------------------------------------------------------------- escaping
@@ -654,6 +662,15 @@ def expand_remote_arg(mud, pattern, rcwd):
     names = [n for n, s in mud.listdir(rdir) if s != -2]    # files only, skip dirs
     return [f"{rdir.rstrip('/')}/{n}" for n in sorted(fnmatch.filter(names, base))]
 
+def render_progress(label, done, total, width=22):
+    """A single-line progress bar that overwrites itself via leading '\\r'.
+    The caller clears the line (\\r\\x1b[K) and prints the result when done."""
+    frac = 1.0 if total <= 0 else min(max(done, 0) / total, 1.0)
+    fill = int(frac * width)
+    bar = "█" * fill + "░" * (width - fill)
+    human = lambda n: f"{n/1024:.1f}K" if n >= 1024 else f"{n}B"
+    return f"\r  {label[:18]:<18} [{bar}] {int(frac*100):3d}%  {human(done)}/{human(total)}"
+
 def cmd_connect(args):
     """Interactive MUD shell: you're connected like telnet (all normal MUD and
     creator commands go straight to the server), plus local /commands to move
@@ -731,10 +748,12 @@ def cmd_connect(args):
                     if os.path.exists(lp) and not overwrite_ok(
                             f"{os.path.basename(lp)} already exists locally — overwrite?"):
                         out(f"\r\n  • skipped {os.path.basename(rp)}\r\n"); continue
-                    data = mud.read_file_bytes(rp, sz)
+                    base = os.path.basename(rp)
+                    out("\r\n")
+                    data = mud.read_file_bytes(rp, sz, progress=lambda d, t: out(render_progress(base, d, t)))
                     open(lp, "wb").write(data)
                     ok = len(data) == sz
-                    out(f"\r\n  {'↓' if ok else '✗'} {os.path.basename(rp)} ({len(data)} b) -> {lp}\r\n")
+                    out(f"\r\x1b[K  {'↓' if ok else '✗'} {base} ({len(data)} b) -> {lp}\r\n")
         elif cmd in ("/upload", "/put"):
             if not a: out("\r\n  usage: /upload <file|glob> [..]   (e.g. *.c)\r\n")
             for pat in a:
@@ -746,10 +765,12 @@ def cmd_connect(args):
                     if mud.file_size(rp) >= 0 and not overwrite_ok(
                             f"{os.path.basename(rp)} already exists on the MUD — overwrite?"):
                         out(f"\r\n  • skipped {os.path.basename(lp)}\r\n"); continue
+                    base = os.path.basename(lp)
+                    out("\r\n")
                     try:
-                        ok = push_one(mud, lp, rp, made)
-                        out(f"\r\n  {'↑' if ok else '✗'} {os.path.basename(lp)} -> {rp}\r\n")
-                    except Exception as e: out(f"\r\n  ✗ {os.path.basename(lp)}: {str(e)[:70]}\r\n")
+                        ok = push_one(mud, lp, rp, made, progress=lambda d, t: out(render_progress(base, d, t)))
+                        out(f"\r\x1b[K  {'↑' if ok else '✗'} {base} -> {rp}\r\n")
+                    except Exception as e: out(f"\r\x1b[K  ✗ {base}: {str(e)[:70]}\r\n")
         else:
             out(f"\r\n  unknown /command: {cmd}  (try /help)\r\n")
         return True
@@ -899,11 +920,11 @@ BINARY_EXTS = (".tar.gz", ".tgz", ".gz", ".tar", ".zip", ".z", ".bz2", ".xz",
                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".pdf",
                ".o", ".so", ".a", ".bin", ".dump", ".db", ".wav", ".mp3")
 
-def push_one(mud, lp, rp, made):
+def push_one(mud, lp, rp, made, progress=None):
     """Push a single local file to the server; return True if verified."""
     ensure_remote_dirs(mud, rp, made)
     data = open(lp, "rb").read()
-    mud.write_file_chunks(rp, data)
+    mud.write_file_chunks(rp, data, progress=progress)
     return verify_remote(mud, rp, data)
 
 def cmd_watch(args):

@@ -78,6 +78,12 @@ If a transfer would **overwrite an existing file**, you're warned and asked
 can't silently clobber your work. (The scriptable `push`/`pull` already compare
 and confirm; this brings the interactive shell in line.)
 
+Each transfer shows a live **progress bar** that fills as the file moves:
+
+```
+  forest_d.c         [██████████░░░░░░░░░░░░]  49%  2.5K/5.2K
+```
+
 Downloaded files land in **`./downloads`** by default (created automatically,
 relative to where you launched), so they don't clutter your working folder.
 Change it any time with `/lcd <dir>`, or start elsewhere with
