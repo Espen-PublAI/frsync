@@ -1200,36 +1200,43 @@ The MUD's permissions decide what you can read/write — exactly like in-game.
 """
 
 def main():
+    # Shared flags live on a parent parser so they're accepted in BOTH positions —
+    # before the subcommand (`frsync -y push a b`) and after the positional args
+    # (`frsync push a b -y`). argument_default=SUPPRESS means an unspecified flag
+    # leaves the namespace untouched, so the parent's copy never clobbers a value
+    # set by the other; p.set_defaults() below supplies the baselines.
+    common = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
+    common.add_argument("--char", metavar="NAME", help="creator name (else prompts)")
+    common.add_argument("--host", help=f"MUD host (default {DEF_HOST})")
+    common.add_argument("--port", type=int, help=f"MUD port (default {DEF_PORT})")
+    common.add_argument("--ext", metavar="LIST", help="only these extensions, e.g. .c,.h (dirs only)")
+    common.add_argument("--delete", action="store_true", help="push: remove dest files missing at source")
+    common.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
+    common.add_argument("-y", "--yes", action="store_true", help="don't ask for confirmation")
+
     p = argparse.ArgumentParser(
-        prog="frsync",
+        prog="frsync", parents=[common],
         description="Sync files between your machine and the Final Realms MUD "
                     "over the normal creator login — no FTP required.",
         epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--char", metavar="NAME", help="creator name (else prompts)")
-    p.add_argument("--host", default=DEF_HOST, help=f"MUD host (default {DEF_HOST})")
-    p.add_argument("--port", type=int, default=DEF_PORT, help=f"MUD port (default {DEF_PORT})")
-    p.add_argument("--ext", metavar="LIST", help="only these extensions, e.g. .c,.h (dirs only)")
-    p.add_argument("--delete", action="store_true", help="push: remove dest files missing at source")
-    p.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
-    p.add_argument("-y", "--yes", action="store_true", help="don't ask for confirmation")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="{status,push,pull,mirror}")
 
-    sp = sub.add_parser("status", help="compare local vs MUD, change nothing")
+    sp = sub.add_parser("status", parents=[common], help="compare local vs MUD, change nothing")
     sp.add_argument("local", help="local file or directory")
     sp.add_argument("remote", help="server file or directory")
-    sp = sub.add_parser("push", help="upload local -> MUD (verified)")
+    sp = sub.add_parser("push", parents=[common], help="upload local -> MUD (verified)")
     sp.add_argument("local", help="local file or directory")
     sp.add_argument("remote", help="server file or directory")
-    sp = sub.add_parser("pull", help="download MUD -> local (verified)")
+    sp = sub.add_parser("pull", parents=[common], help="download MUD -> local (verified)")
     sp.add_argument("remote", help="server file or directory")
     sp.add_argument("local", help="local file or directory")
-    sp = sub.add_parser("watch", help="auto-push a local folder as files change (synced-folder mode)")
+    sp = sub.add_parser("watch", parents=[common], help="auto-push a local folder as files change (synced-folder mode)")
     sp.add_argument("local", help="local directory to watch")
     sp.add_argument("remote", help="server directory to upload into")
     sp.add_argument("--interval", type=float, default=2.0, help="poll seconds (default 2)")
-    sp = sub.add_parser("connect", help="interactive MUD shell with /download and /upload")
+    sp = sub.add_parser("connect", parents=[common], help="interactive MUD shell with /download and /upload")
     sp.add_argument("--dir", help="initial local folder for transfers (default: current dir)")
-    mp = sub.add_parser("mirror", help="bulk-download server subtrees, resumable")
+    mp = sub.add_parser("mirror", parents=[common], help="bulk-download server subtrees, resumable")
     mp.add_argument("localbase", help="local dir to mirror into (server paths preserved under it)")
     mp.add_argument("roots", nargs="+", metavar="root",
                     help="server dirs to mirror, e.g. /std /d /w/<creator>")
@@ -1240,6 +1247,12 @@ def main():
                     help="skip files larger than this (default 1 MB; 0 = no limit)")
     sub.metavar = "{connect,status,push,pull,watch,mirror}"
     args = p.parse_args()
+    # The shared flags use SUPPRESS (so a flag given in one position never gets
+    # reset by the parser in the other), so fill the baselines for any not given.
+    for k, v in dict(char=None, host=DEF_HOST, port=DEF_PORT, ext=None,
+                     delete=False, dry_run=False, yes=False).items():
+        if not hasattr(args, k):
+            setattr(args, k, v)
     {"status": cmd_status, "push": cmd_push, "pull": cmd_pull,
      "watch": cmd_watch, "mirror": cmd_mirror, "connect": cmd_connect}[args.cmd](args)
 
