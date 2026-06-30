@@ -576,9 +576,11 @@ def cmd_push(args):
         rp = args.remote if is_file else f"{args.remote}/{rel}"
         ensure_remote_dirs(mud, rp, made)
         data = open(lp, "rb").read()
-        mud.write_file_chunks(rp, data)
+        label = rel or os.path.basename(rp)
+        mud.write_file_chunks(rp, data, progress=cli_progress(label))
         ok = verify_remote(mud, rp, data)
-        print(f"  {'OK ' if ok else 'FAIL'}  push  {rel or os.path.basename(rp)}")
+        cli_progress_clear()
+        print(f"  {'OK ' if ok else 'FAIL'}  push  {label}")
     if args.delete and extra:
         for rel in sorted(extra):
             rp = f"{args.remote}/{rel}"
@@ -614,11 +616,13 @@ def cmd_pull(args):
     if not confirm(args, f"Download {len(todo)} file(s) to {args.local}?"):
         mud.close(); return
     for rel, rp, lp, rs in todo:
-        data = mud.read_file_bytes(rp, rs)
+        label = rel or os.path.basename(rp)
+        data = mud.read_file_bytes(rp, rs, progress=cli_progress(label))
         os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
         open(lp, "wb").write(data)
         ok = (len(data) == rs)
-        print(f"  {'OK ' if ok else 'FAIL'}  pull  {rel or os.path.basename(rp)} ({len(data)} b)")
+        cli_progress_clear()
+        print(f"  {'OK ' if ok else 'FAIL'}  pull  {label} ({len(data)} b)")
     mud.close()
 
 def resolve_remote(arg, rcwd):
@@ -670,6 +674,20 @@ def render_progress(label, done, total, width=22):
     bar = "█" * fill + "░" * (width - fill)
     human = lambda n: f"{n/1024:.1f}K" if n >= 1024 else f"{n}B"
     return f"\r  {label[:18]:<18} [{bar}] {int(frac*100):3d}%  {human(done)}/{human(total)}"
+
+def cli_progress(label):
+    """A progress callback for the scriptable commands: draws an in-place bar on
+    a real terminal, or None when stdout is redirected (keeps logs/CI clean)."""
+    if not sys.stdout.isatty():
+        return None
+    def cb(done, total):
+        sys.stdout.write(render_progress(label, done, total)); sys.stdout.flush()
+    return cb
+
+def cli_progress_clear():
+    """Erase the current bar line before printing a result (TTY only)."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\x1b[K")
 
 def cmd_connect(args):
     """Interactive MUD shell: you're connected like telnet (all normal MUD and
