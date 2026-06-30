@@ -44,12 +44,35 @@ PULL_CHUNK      = 4096    # source bytes per read_bytes() call
 IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
+def _utf8_incomplete_tail(b):
+    """How many trailing bytes of `b` are the start of a UTF-8 multibyte
+    character that isn't complete yet — so a streaming reader can hold them
+    until the rest arrives. Returns 0 on a clean boundary, or when the tail
+    isn't a valid lead+continuation run (left for the decoder to handle)."""
+    n = len(b)
+    if not n:
+        return 0
+    i, steps = n - 1, 0
+    while i >= 0 and 0x80 <= b[i] <= 0xBF and steps < 3:   # back over continuations
+        i -= 1; steps += 1
+    if i < 0:
+        return 0
+    lead = b[i]
+    if   0xC0 <= lead <= 0xDF: need = 2
+    elif 0xE0 <= lead <= 0xEF: need = 3
+    elif 0xF0 <= lead <= 0xF7: need = 4
+    else:
+        return 0                       # ASCII or invalid lead — nothing to hold
+    have = n - i                       # bytes present from the lead through the end
+    return have if have < need else 0
+
 class Mud:
     SOCK_TIMEOUT = 90   # no single send/recv may block longer than this
 
     def __init__(self, host, port):
         self.host, self.port = host, port
         self.char = self.pw = None
+        self._rx_carry = b""   # bytes held back mid-UTF-8-char / mid-telnet-seq
         self.s = socket.create_connection((host, port), timeout=25)
         self.s.settimeout(self.SOCK_TIMEOUT)
 
@@ -57,6 +80,7 @@ class Mud:
         """Re-establish a dropped session (e.g. after the server resets us)."""
         try: self.s.close()
         except OSError: pass
+        self._rx_carry = b""        # new socket -> drop any half-decoded bytes
         for attempt in range(5):
             try:
                 self.s = socket.create_connection((self.host, self.port), timeout=25)
@@ -70,27 +94,50 @@ class Mud:
         raise RuntimeError("could not reconnect to the MUD")
 
     def _strip_iac(self, data):
-        out, reply, i = bytearray(), bytearray(), 0
-        while i < len(data):
+        # Prepend bytes held back from the previous read: a telnet sequence or a
+        # UTF-8 multibyte character that was split across two network reads.
+        data = self._rx_carry + data
+        self._rx_carry = b""
+        out, reply, i, n = bytearray(), bytearray(), 0, len(data)
+        iac_tail = b""
+        while i < n:
             b = data[i]
-            if b == IAC and i + 1 < len(data):
+            if b == IAC:
+                if i + 1 >= n:                          # IAC split across reads
+                    iac_tail = bytes(data[i:]); break
                 cmd = data[i + 1]
-                if cmd in (DO, DONT, WILL, WONT) and i + 2 < len(data):
+                if cmd in (DO, DONT, WILL, WONT):
+                    if i + 2 >= n:                      # option byte not here yet
+                        iac_tail = bytes(data[i:]); break
                     opt = data[i + 2]
                     if cmd == DO:   reply += bytes([IAC, WONT, opt])
                     elif cmd == WILL: reply += bytes([IAC, DONT, opt])
                     i += 3; continue
                 if cmd == SB:
                     j = i + 2
-                    while j + 1 < len(data) and not (data[j] == IAC and data[j + 1] == SE):
+                    while j + 1 < n and not (data[j] == IAC and data[j + 1] == SE):
                         j += 1
+                    if j + 1 >= n:                      # subnegotiation not terminated yet
+                        iac_tail = bytes(data[i:]); break
                     i = j + 2; continue
                 i += 2; continue
             out.append(b); i += 1
         if reply:
             try: self.s.sendall(bytes(reply))
             except OSError: pass
-        return out.decode("latin-1", "replace")
+        # Decode the clean bytes as UTF-8, holding back an incomplete trailing
+        # multibyte char; fall back to latin-1 for legacy 8-bit content.
+        clean = bytes(out)
+        m = len(clean)
+        hold = _utf8_incomplete_tail(clean)
+        body, utf8_tail = (clean[:m - hold], clean[m - hold:]) if hold else (clean, b"")
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            text = body.decode("latin-1")
+        # leftover, in stream order: the held UTF-8 tail, then any split telnet seq
+        self._rx_carry = utf8_tail + iac_tail
+        return text
 
     def drain(self, quiet=1.2):
         buf, end = [], time.time() + quiet
@@ -116,7 +163,16 @@ class Mud:
         return "".join(buf)
 
     def send(self, line):
+        # latin-1 / byte-preserving: used for the login, exec, and file-transfer
+        # protocol where each char maps 1:1 to a server byte. Do NOT switch this
+        # to UTF-8 — write_file_chunks relies on the latin-1 round-trip.
         self.s.sendall((line + "\n").encode("latin-1"))
+
+    def send_text(self, line):
+        # UTF-8: for human-typed input in the interactive shell, so a creator can
+        # type accented/Unicode text. ASCII is identical to send(); only non-ASCII
+        # input differs (and would otherwise raise on the latin-1 encode).
+        self.s.sendall((line + "\n").encode("utf-8"))
 
     def close(self):
         try: self.s.close()
@@ -175,6 +231,7 @@ class Mud:
     # ------------------------------------------------------------ exec helpers
     def _flush(self):
         """Discard any pending socket data (stale prompt/spam) before a command."""
+        self._rx_carry = b""        # also drop any half-decoded bytes we were holding
         while True:
             r, _, _ = select.select([self.s], [], [], 0)
             if not r: break
@@ -663,7 +720,7 @@ def cmd_connect(args):
                 if line.startswith("/"):
                     if not do_local(line): break
                 else:
-                    mud.send(line)
+                    mud.send_text(line)        # UTF-8: allow typing Unicode
     except KeyboardInterrupt:
         pass
     finally:

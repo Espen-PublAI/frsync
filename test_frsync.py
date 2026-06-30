@@ -175,6 +175,41 @@ def test_latin1_fallback_on_read():
     assert out == legacy.decode("latin-1")
 
 
+def _stream_decode(raw: bytes, sizes):
+    """Feed `raw` to Mud._strip_iac in chunks of the given sizes (cycled),
+    mirroring the interactive read loop, and return (decoded_text, leftover)."""
+    class _Sock:
+        def sendall(self, b): pass            # swallow IAC negotiation replies
+    m = object.__new__(frsync.Mud)
+    m.s = _Sock(); m._rx_carry = b""
+    out, i, k = [], 0, 0
+    while i < len(raw):
+        step = sizes[k % len(sizes)]; k += 1
+        out.append(m._strip_iac(raw[i:i + step])); i += step
+    return "".join(out), m._rx_carry
+
+
+def test_stream_utf8_split_across_reads():
+    # The interactive shell decodes the live MUD stream; a multibyte char split
+    # across two recv() reads must still render, not turn into mojibake.
+    text = "floors — blåbær & smørbrød. 日本語 ok.\r\n"
+    raw = text.encode("utf-8")
+    got, carry = _stream_decode(raw, [1])          # byte-at-a-time = worst case
+    assert got == text and carry == b"", (got, carry)
+    for sizes in ([2], [3], [5], [7, 1, 4]):
+        got, carry = _stream_decode(raw, sizes)
+        assert got == text and carry == b"", (sizes, got, carry)
+
+
+def test_stream_iac_inside_multibyte_char():
+    # A telnet negotiation (IAC WILL ECHO) injected between the two bytes of 'ø'
+    # must be stripped and the char reassembled.
+    IAC, WILL, ECHO = 255, 251, 1
+    raw = b"sm\xc3" + bytes([IAC, WILL, ECHO]) + b"\xb8r \xe2\x80\x94"   # "smør —"
+    got, carry = _stream_decode(raw, [len(raw)])
+    assert got == "smør —" and carry == b"", (got, carry)
+
+
 # --------------------------------------------------------------------- runner
 class _FakeSelf:
     """Stand-in for a Mud instance: _write_once only touches _flush/send/expect."""
@@ -200,6 +235,8 @@ def main():
         ("UTF-8 round-trips through transport",     lambda: test_utf8_roundtrip_through_transport()),
         ("no silent '?' replacement",               lambda: test_no_silent_replacement()),
         ("latin-1 fallback on read",                lambda: test_latin1_fallback_on_read()),
+        ("stream UTF-8 split across reads",         lambda: test_stream_utf8_split_across_reads()),
+        ("stream IAC inside multibyte char",        lambda: test_stream_iac_inside_multibyte_char()),
     ]
     failed = 0
     for name, fn in tests:
