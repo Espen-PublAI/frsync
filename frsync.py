@@ -873,7 +873,11 @@ def cmd_connect(args):
         ask_key = _ask_key_cooked
         try:
             while True:
-                r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
+                sock = mud.s        # re-read each loop: a transfer may have reconnected
+                try:
+                    r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
+                except (ValueError, OSError):
+                    out("\r\n*** MUD connection lost. ***\r\n"); break
                 if sock in r:
                     data = sock.recv(65536)
                     if not data: out("\r\n*** MUD closed the connection. ***\r\n"); break
@@ -905,7 +909,11 @@ def cmd_connect(args):
     ask_key = _ask_key_raw
     try:
         while True:
-            r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
+            sock = mud.s            # re-read each loop: a transfer may have reconnected
+            try:
+                r, _, _ = select.select([sys.stdin, sock], [], [], 0.3)
+            except (ValueError, OSError):
+                out("\r\n*** MUD connection lost. ***\r\n"); break
             if sock in r:
                 data = sock.recv(65536)
                 if not data: out("\r\n*** MUD closed the connection. ***\r\n"); break
@@ -948,7 +956,8 @@ def cmd_connect(args):
     except KeyboardInterrupt:
         pass
     finally:
-        restore_term()
+        try: restore_term()          # always restore the terminal, even on error
+        except Exception: pass
         out("\r\nDisconnected.\r\n")
         mud.close()
 
