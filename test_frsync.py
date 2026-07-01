@@ -370,6 +370,13 @@ def test_lint_custom_exit_wrapper():
     assert hit and hit[0]["path"] == "/w/malric/df/rooms/dream05.c"
     # without the wrapper it would be invisible (not even counted)
     assert not frsync.extract_references(room, defs)
+    # the wrapper's OWN definition line ("string dest") must not be mistaken for
+    # a call to itself — a parameter declaration is not a reference. (The body's
+    # internal add_exit(dir, dest) is still seen, but as a dynamic path=None ref.)
+    base_refs = frsync.extract_references(base, defs, wrappers)
+    assert not any(r["expr"] == "string dest" for r in base_refs)
+    assert frsync._is_param_decl("string dest") and frsync._is_param_decl("object *who")
+    assert not frsync._is_param_decl("DF_DREAM05") and not frsync._is_param_decl('"north"')
 
 
 def test_unified_diff_lines():
