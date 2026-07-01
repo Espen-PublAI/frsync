@@ -274,6 +274,37 @@ def test_dropped_files_detection(tmpdir):
     assert frsync.dropped_files("") is None
 
 
+def test_recursive_plan_with_subfolders(tmpdir):
+    # what `/sync to-mud` relies on: plan() must walk subfolders and classify
+    # every file as new / diff / same / remote_only across the whole tree.
+    root = os.path.join(tmpdir, "syncroot")          # isolated tree (runner shares tmp)
+    os.makedirs(os.path.join(root, "rooms"))
+    open(os.path.join(root, "area.c"), "w").write("area")          # exists remote, differs
+    open(os.path.join(root, "rooms", "hut.c"), "w").write("hut")   # new (not on remote)
+    open(os.path.join(root, "rooms", "well.c"), "w").write("well") # matches remote exactly
+    wsize, wcrc = frsync.local_size_crc(os.path.join(root, "rooms", "well.c"))
+    ROOT = "/w/x"
+
+    class FakeMud:
+        def walk(self, root):                       # remote has an extra file too
+            return ["area.c", "rooms/well.c", "rooms/old.c"]
+        def file_size(self, rp):
+            return {f"{ROOT}/area.c": 999,          # size differs from local -> diff
+                    f"{ROOT}/rooms/well.c": wsize,
+                    f"{ROOT}/rooms/old.c": 5}.get(rp, -1)
+        def crc32_remote(self, rp):
+            return wcrc if rp.endswith("well.c") else 0xDEAD
+
+    st = frsync.plan(FakeMud(), root, ROOT, [], is_file=False)
+    assert st["area.c"] == "diff"
+    assert st["rooms/hut.c"] == "new"
+    assert st["rooms/well.c"] == "same"
+    assert st["rooms/old.c"] == "remote_only"
+    # the sync would upload only new + diff, recreating subfolders on the far side
+    todo = sorted(r for r, s in st.items() if s in ("new", "diff"))
+    assert todo == ["area.c", "rooms/hut.c"]
+
+
 # --------------------------------------------------------------------- runner
 class _FakeSelf:
     """Stand-in for a Mud instance: _write_once only touches _flush/send/expect."""
@@ -318,6 +349,7 @@ def main():
         ("local glob expansion (*.c, cloud*.c)",     lambda: test_local_glob_expansion(tmp)),
         ("remote glob expansion (*.c, *.*)",         lambda: test_remote_glob_expansion()),
         ("drag-and-drop path detection",             lambda: test_dropped_files_detection(tmp)),
+        ("recursive plan across subfolders",         lambda: test_recursive_plan_with_subfolders(tmp)),
     ]
     failed = 0
     for name, fn in tests:

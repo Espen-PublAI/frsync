@@ -888,6 +888,11 @@ def cmd_connect(args):
     def batch_transfer(jobs, arrow, dest):
         pinned_batch(jobs, arrow, dest, write=out, ask_key=ask_key, bar=sys.stdout.isatty())
 
+    def confirm_key(prompt):
+        """Ask a yes/no question (default yes). True unless the user says no."""
+        if not ask_key: return True
+        return ask_key(prompt) in ("y", "\r", "\n", "")
+
     def upload_local_files(paths):
         """Push a list of local files to the current remote folder, one batch
         bar, overwrite prompt per existing file. Shared by /upload and the
@@ -909,12 +914,64 @@ def cmd_connect(args):
         n = len(paths)
         names = "  ".join(os.path.basename(p) for p in paths)
         out(f"\r\n  ↑ dropped {n} file(s) → {state['rcwd']}\r\n    {names}\r\n")
-        ans = ask_key("  upload? [Y/n] ") if ask_key else "y"
-        if ans in ("y", "\r", "\n", ""):
+        if confirm_key("  upload? [Y/n] "):
             upload_local_files(paths)
         else:
             out("  cancelled.\r\n")
         return True
+
+    def do_sync(direction):
+        """Recursively mirror the whole current folder — every file and subfolder,
+        recreating the tree on the far side. Only new/changed files move (matching
+        files are skipped), and nothing is deleted. `direction` is "up" (local →
+        MUD) or "down" (MUD → local)."""
+        lroot, rroot = state["local"], state["rcwd"]
+        if direction == "up":
+            out(f"\r\n  scanning {lroot} …\r\n")
+            st = plan(mud, lroot, rroot, [], is_file=False)
+            todo = sorted(r for r, s in st.items() if s in ("new", "diff"))
+            same = sum(1 for s in st.values() if s == "same")
+            if not todo:
+                out(f"  already in sync — {same} file(s) match.\r\n"); return
+            out(f"  {len(todo)} file(s) to upload → {rroot}"
+                + (f"   ({same} already match)" if same else "") + "\r\n")
+            if not confirm_key(f"  sync {len(todo)} file(s) to the MUD? [Y/n] "):
+                out("  cancelled.\r\n"); return
+            jobs = []
+            for rel in todo:
+                lp = os.path.join(lroot, rel); rp = f"{rroot}/{rel.replace(os.sep, '/')}"
+                sz = len(local_norm(open(lp, "rb").read()))
+                def send(progress, lp=lp, rp=rp):
+                    return push_one(mud, lp, rp, made, progress=progress)
+                jobs.append({"base": rel, "size": sz, "exists": False, "run": send})
+            out("\r\n"); batch_transfer(jobs, "↑", rroot)
+        else:
+            out(f"\r\n  scanning {rroot} …\r\n")
+            rels = mud.walk(rroot)
+            if not rels:
+                out(f"  nothing to download from {rroot}.\r\n"); return
+            todo = []
+            for rel in rels:
+                rp = f"{rroot}/{rel}"; lp = os.path.join(lroot, *rel.split("/"))
+                rs = mud.file_size(rp)
+                if rs < 0: continue
+                if os.path.isfile(lp):
+                    lsize, lsum = local_size_sum(lp)
+                    if lsize == rs and lsum == mud.byte_sum(rp): continue
+                todo.append((rel, rp, lp, rs))
+            if not todo:
+                out(f"  already in sync — {len(rels)} file(s) match.\r\n"); return
+            out(f"  {len(todo)} file(s) to download → {lroot}\r\n")
+            if not confirm_key(f"  sync {len(todo)} file(s) to this computer? [Y/n] "):
+                out("  cancelled.\r\n"); return
+            jobs = []
+            for rel, rp, lp, rs in todo:
+                def fetch(progress, rp=rp, rs=rs, lp=lp):
+                    data = mud.read_file_bytes(rp, rs, progress=progress)
+                    os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
+                    open(lp, "wb").write(data); return len(data) == rs
+                jobs.append({"base": rel, "size": rs, "exists": False, "run": fetch})
+            out("\r\n"); batch_transfer(jobs, "↓", lroot)
 
     HELP = (
         "\r\n"
@@ -929,9 +986,13 @@ def cmd_connect(args):
         "     /rcd <dir>        set the remote folder used for transfers\r\n"
         "\r\n"
         "   Transfer files   (names or globs: *.c, cloud*.c, *.* — space-separated)\r\n"
-        "     /download f [..]  pull file(s)   remote → local   (alias /get)\r\n"
-        "     /upload   f [..]  push file(s)   local → remote   (alias /put)\r\n"
+        "     /download f [..]  get file(s)    remote → local   (alias /get)\r\n"
+        "     /upload   f [..]  send file(s)   local → remote   (alias /put)\r\n"
         "                       …or drag files onto this window to upload them\r\n"
+        "\r\n"
+        "   Sync a whole folder tree   (recursive: every file + subfolder)\r\n"
+        "     /push             upload everything    local → remote\r\n"
+        "     /pull             download everything  remote → local\r\n"
         "\r\n"
         "   Session\r\n"
         "     /where            show current local + remote folders\r\n"
@@ -984,6 +1045,8 @@ def cmd_connect(args):
                     if not os.path.isfile(lp): out(f"\r\n  ✗ {os.path.basename(lp)}: no such local file\r\n"); continue
                     paths.append(lp)
             upload_local_files(paths)
+        elif cmd == "/push": do_sync("up")
+        elif cmd == "/pull": do_sync("down")
         else:
             out(f"\r\n  unknown /command: {cmd}  (try /help)\r\n")
         return True
@@ -1204,6 +1267,8 @@ def welcome_banner():
         "        /upload <file>      send a local file  -> remote folder\r\n"
         "        (or just drag files onto this window to upload them)\r\n"
         "        /download <file>    fetch a remote file -> this computer\r\n"
+        "        /push               upload the whole folder tree (recursive)\r\n"
+        "        /pull               download the whole folder tree (recursive)\r\n"
         "        /where              show your local + remote folders\r\n"
         "        /lcd <dir>          change the local folder (downloads land here)\r\n"
         "        /rcd <dir>          change the remote folder (transfers use this)\r\n"
