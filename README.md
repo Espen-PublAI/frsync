@@ -108,6 +108,11 @@ MUD. It reports broken references as `file:line  kind → /path`, so a mistyped
 exit or a room you renamed-but-forgot-to-repoint is caught before a player walks
 into it.
 
+It also **learns your area's helper functions**: if a room wires exits through a
+custom wrapper like `add_dream_exit(dir, dest, type)` that forwards to `add_exit`,
+`/lint` detects it and checks calls to the wrapper too — so an area whose exits
+all go through a helper is still fully covered, not silently skipped.
+
 References it can't resolve statically — a path built from a runtime variable,
 or a macro defined outside the area (e.g. a standard mudlib path like `WEAPON`) —
 are **counted and skipped, never silently dropped**; run `/lint -v` to list them
