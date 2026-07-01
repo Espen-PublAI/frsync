@@ -1963,6 +1963,17 @@ _REF_CALLS = [("add_exit", 1, "exit"), ("clone_object", 0, "clone_object"),
 
 _FUNC_RX = re.compile(r"\b([A-Za-z_]\w*)\s*\(([^;{)]*)\)\s*\{")
 _NOT_FUNCS = {"if", "while", "for", "foreach", "switch", "catch", "do", "return"}
+# LPC type/modifier keywords that begin a parameter declaration.
+_LPC_TYPES = {"void", "int", "string", "object", "mapping", "mixed", "float",
+              "status", "buffer", "function", "array", "class", "varargs",
+              "nomask", "static", "private", "public", "protected", "nosave", "ref"}
+
+def _is_param_decl(arg):
+    """True if `arg` looks like a parameter declaration (`string dest`) rather
+    than a call argument — i.e. a function definition/prototype matched as a call
+    to itself. Its first token is an LPC type keyword and a name follows."""
+    toks = arg.replace("*", " ").split()
+    return len(toks) >= 2 and toks[0] in _LPC_TYPES
 
 def _param_names(paramstr):
     """Names of a function's parameters (last identifier of each `type name`)."""
@@ -2032,7 +2043,10 @@ def extract_references(text, defines, wrappers=None):
     calls += [(fn, idx, kind) for fn, (kind, idx) in (wrappers or {}).items()]
     for fn, idx, kind in calls:
         for args, off in _find_calls(text, fn):
-            if len(args) > idx and args[idx].strip():
+            arg = args[idx].strip() if len(args) > idx else ""
+            # skip the function's OWN definition/prototype: there the "argument"
+            # is a parameter declaration ("string dest"), not a real call arg.
+            if arg and not _is_param_decl(arg):
                 add(kind, args[idx], off)
     for m in re.finditer(r'#\s*include\s+"([^"]+)"', text):
         p = m.group(1)
