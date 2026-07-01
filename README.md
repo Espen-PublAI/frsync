@@ -64,6 +64,8 @@ for moving files:
 | `/download <f> [..]` | fetch remote file(s) → this computer |
 | `/push`              | mirror the **whole** local folder tree → remote (recursive) |
 | `/pull`              | mirror the **whole** remote folder tree → local (recursive) |
+| `/rm <f> [..]`       | delete remote file(s)/empty dir(s) — **asks first**, default no (alias `/del`) |
+| `/mv <src> <dst>`    | rename / move a remote file (alias `/rename`) |
 | `/update [-o] <f>`   | recompile file(s) in-game; prints compile errors as `file:line: msg` |
 | `/goto <file>`       | teleport into a room by its file |
 | `/clone <file>`      | clone an object to test it |
@@ -204,10 +206,16 @@ also just copy or paste it anywhere and run it.
 
 This exposes the MUD to an AI agent as tools: `mud_ls`, `mud_read`,
 `mud_write`, `mud_update`, `mud_errors`, `mud_download`, `mud_upload`,
-`mud_command`, `mud_exec`, `mud_whoami`. So an agent can read a room, fix a bug,
-write it back, **`mud_update` to reload it and catch compile errors**, then
-**`mud_errors` to read runtime errors** — the full build/test loop. (There is
-deliberately **no delete tool** — the server never removes server files.)
+`mud_delete`, `mud_rename`, `mud_command`, `mud_exec`, `mud_whoami`. So an agent
+can read a room, fix a bug, write it back, **`mud_update` to reload it and catch
+compile errors**, then **`mud_errors` to read runtime errors** — the full
+build/test loop.
+
+**Deleting is gated on a human.** `mud_delete` (and `mud_rename` when it would
+overwrite an existing file) call MCP **elicitation** to ask *you* to confirm
+before anything is removed — the agent cannot delete server files on its own,
+and if your client can't show that prompt the delete is refused. The human
+interactive shell has the same guardrail: `/rm` asks first and defaults to *no*.
 
 ### 1. Install the dependencies
 
@@ -305,7 +313,9 @@ access you don't already have as a builder.
 
 A few things worth knowing:
 
-- **Nothing on the server is deleted** unless you explicitly pass `push --delete`.
+- **Nothing on the server is deleted** unless you ask: `push --delete`, the
+  shell's `/rm` (which asks first, default no), or `mud_delete` (which asks
+  *you* to confirm before the agent can remove anything).
 - Every `push`/`pull` is **verified** by comparing size + checksum on both ends.
 - `mirror` is **resumable** — stop any time and re-run; it skips what's already
   downloaded (the file list is cached in a `.frmanifest_*.tsv`).

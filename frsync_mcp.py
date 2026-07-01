@@ -40,9 +40,13 @@ TOOLS
   mud_errors([lines])         tail your creator error log (runtime/compile)
   mud_download(remote, local) save a server file to local disk
   mud_upload(local, remote)   upload a local file to the server (verified)
+  mud_delete(path)            delete a file/empty dir — REQUIRES a human Y/N
+  mud_rename(src, dst)        rename/move a file — Y/N only if dst is overwritten
   mud_whoami()                show connection / who we're logged in as
 
-Deliberately NO delete tool — this server never removes server files.
+DELETING: mud_delete (and an overwriting mud_rename) never act on their own —
+they call MCP elicitation to ask the human user to confirm, and refuse if the
+client can't show that prompt. The agent cannot delete server files unilaterally.
 """
 import functools, json, os, re, subprocess, sys, threading
 
@@ -177,12 +181,22 @@ def clear_credentials():
 
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    import anyio
+    import anyio.to_thread          # noqa: F401  (ensure the submodule is loaded)
+    from mcp.server.fastmcp import Context, FastMCP
+    from pydantic import BaseModel
 except ImportError:
     sys.stderr.write("frsync_mcp: the 'mcp' package is required — run: pip install mcp\n")
     raise SystemExit(1)
 
 mcp = FastMCP("frsync-mud")
+
+
+class _Confirm(BaseModel):
+    """Elicitation schema for a destructive action. `confirm` defaults True so a
+    plain accept means yes; the user cancels by declining the prompt (or by
+    setting confirm=false in clients that render the field)."""
+    confirm: bool = True
 
 _mud = None
 _lock = threading.Lock()   # serialise access to the single MUD connection
@@ -381,6 +395,83 @@ def mud_upload(local: str, remote: str) -> str:
         m.write_file_chunks(remote, data)
         ok = frsync.verify_remote(m, remote, data)
     return f"{'OK' if ok else 'FAILED VERIFY'}: {local} -> {remote} ({len(data)} bytes)"
+
+# --- destructive tools: gated on a real human Y/N via MCP elicitation ---------
+async def _ask_user(ctx, message):
+    """Ask the human to confirm a destructive action. Returns True only on an
+    explicit accept. If the client can't show a prompt (no elicitation support),
+    returns None so the caller refuses rather than deleting blind."""
+    try:
+        res = await ctx.elicit(message=message, schema=_Confirm)
+    except Exception:
+        return None                       # client can't prompt -> fail safe
+    return res.action == "accept" and getattr(res.data, "confirm", True)
+
+@mcp.tool()
+async def mud_delete(path: str, ctx: Context) -> str:
+    """Delete a server file (or an EMPTY directory). This asks the human user to
+    confirm first via a prompt — the agent cannot delete on its own, and if the
+    client can't show the prompt the deletion is refused. There is no undo."""
+    def _size():
+        with _lock: return _get().file_size(path)
+    try:
+        sz = await anyio.to_thread.run_sync(_size)
+    except OSError:
+        _reset_session(); raise
+    if sz < 0:
+        return f"(not found: {path})"
+    kind = "empty directory" if sz == -2 else f"file ({sz} bytes)"
+    ok = await _ask_user(ctx, f"Delete this {kind} on the MUD? There is no undo:\n  {path}")
+    if ok is None:
+        return ("Refused: this client can't show a confirmation prompt, so the "
+                "delete was not performed. Delete it from the FRsync interactive "
+                "shell with /rm instead.")
+    if not ok:
+        return f"Cancelled by user — {path} was NOT deleted."
+    def _do():
+        with _lock:
+            m = _get()
+            return m.rmdir(path) if sz == -2 else m.rm(path)
+    try:
+        done = await anyio.to_thread.run_sync(_do)
+    except OSError:
+        _reset_session(); raise
+    if done:
+        return f"OK: deleted {path}"
+    return f"FAILED to delete {path}" + (" (directory not empty?)" if sz == -2 else "")
+
+@mcp.tool()
+async def mud_rename(src: str, dst: str, ctx: Context) -> str:
+    """Rename or move a server file from `src` to `dst`. Non-destructive when
+    `dst` is new; if `dst` already exists it would be overwritten, so that case
+    asks the human user to confirm first (and refuses if it can't prompt)."""
+    def _sizes():
+        with _lock:
+            m = _get(); return m.file_size(src), m.file_size(dst)
+    try:
+        ssz, dsz = await anyio.to_thread.run_sync(_sizes)
+    except OSError:
+        _reset_session(); raise
+    if ssz < 0:
+        return f"(not found: {src})"
+    if dsz >= 0:                                   # would clobber an existing dst
+        ok = await _ask_user(ctx, f"{dst} already exists — overwrite it by moving "
+                                  f"{src} onto it? There is no undo.")
+        if ok is None:
+            return ("Refused: this client can't show a confirmation prompt and "
+                    f"{dst} exists. Do the move from the FRsync shell with /mv.")
+        if not ok:
+            return f"Cancelled by user — {src} was NOT moved."
+    def _do():
+        with _lock:
+            m = _get()
+            if dsz >= 0: m.rm(dst)                  # rename won't clobber; clear first
+            return m.rename(src, dst)
+    try:
+        done = await anyio.to_thread.run_sync(_do)
+    except OSError:
+        _reset_session(); raise
+    return f"OK: moved {src} -> {dst}" if done else f"FAILED to move {src} -> {dst}"
 
 def _cli(argv):
     """Interactive credential management — run from a real terminal, not the MCP

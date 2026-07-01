@@ -305,6 +305,27 @@ def test_recursive_plan_with_subfolders(tmpdir):
     assert todo == ["area.c", "rooms/hut.c"]
 
 
+def test_delete_rename_return_codes():
+    # The subtle bit: rm()/rmdir() return 1 on success, but rename() returns 0 on
+    # success (verified live on FR:Legacy). The Mud wrappers must map each to bool
+    # correctly, and a lost result (exec_int -> None) must read as failure.
+    class FakeExec:
+        def __init__(self, val): self.val, self.sent = val, None
+        def exec_int(self, code): self.sent = code; return self.val
+    assert frsync.Mud.rm(FakeExec(1), "/w/x/a.c") is True
+    assert frsync.Mud.rm(FakeExec(0), "/w/x/a.c") is False
+    assert frsync.Mud.rm(FakeExec(None), "/w/x/a.c") is False
+    assert frsync.Mud.rmdir(FakeExec(1), "/w/x/d") is True
+    assert frsync.Mud.rmdir(FakeExec(0), "/w/x/d") is False
+    assert frsync.Mud.rename(FakeExec(0), "/a", "/b") is True    # 0 == success here
+    assert frsync.Mud.rename(FakeExec(1), "/a", "/b") is False
+    assert frsync.Mud.rename(FakeExec(None), "/a", "/b") is False
+    # and the right efuns are actually invoked
+    f = FakeExec(1); frsync.Mud.rm(f, "/w/x/a.c");   assert 'rm("/w/x/a.c")' in f.sent
+    f = FakeExec(1); frsync.Mud.rmdir(f, "/w/x/d");  assert 'rmdir("/w/x/d")' in f.sent
+    f = FakeExec(0); frsync.Mud.rename(f, "/a", "/b"); assert 'rename("/a", "/b")' in f.sent
+
+
 def test_parse_update_output():
     # exact strings the live FR:Legacy `update` command emits (captured 2026-07)
     fail = ("E /w/malric/room.c at line 2 : Undefined variable 'x' before  ; }\n"
@@ -375,6 +396,7 @@ def main():
         ("drag-and-drop path detection",             lambda: test_dropped_files_detection(tmp)),
         ("recursive plan across subfolders",         lambda: test_recursive_plan_with_subfolders(tmp)),
         ("parse update/reload output",               lambda: test_parse_update_output()),
+        ("delete/rename return codes",               lambda: test_delete_rename_return_codes()),
     ]
     failed = 0
     for name, fn in tests:

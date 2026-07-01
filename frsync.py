@@ -327,6 +327,18 @@ class Mud:
     def mkdir(self, path):
         self.exec_int(f'return mkdir("{path}");')
 
+    def rm(self, path):
+        """Delete a server file. Returns True on success (rm() efun -> 1=ok)."""
+        return self.exec_int(f'return rm("{path}");') == 1
+
+    def rmdir(self, path):
+        """Remove an EMPTY server directory. True on success (rmdir() -> 1=ok)."""
+        return self.exec_int(f'return rmdir("{path}");') == 1
+
+    def rename(self, src, dst):
+        """Rename/move a server file. True on success (rename() efun -> 0=ok)."""
+        return self.exec_int(f'return rename("{src}", "{dst}");') == 0
+
     def listdir(self, path):
         """Return list of (name, size) for one dir. size -2 == subdirectory."""
         code = ('string r=""; string h=""; mixed *a=get_dir("%s/", -1); int i; '
@@ -909,10 +921,13 @@ def cmd_connect(args):
     def batch_transfer(jobs, arrow, dest):
         pinned_batch(jobs, arrow, dest, write=out, ask_key=ask_key, bar=sys.stdout.isatty())
 
-    def confirm_key(prompt):
-        """Ask a yes/no question (default yes). True unless the user says no."""
-        if not ask_key: return True
-        return ask_key(prompt) in ("y", "\r", "\n", "")
+    def confirm_key(prompt, default_yes=True):
+        """Ask a yes/no question. With default_yes, Enter means yes (used for
+        transfers); with default_yes=False, only an explicit 'y' confirms (used
+        for destructive actions like /rm)."""
+        if not ask_key: return default_yes
+        ans = ask_key(prompt)
+        return ans in ("y", "\r", "\n", "") if default_yes else ans == "y"
 
     def reload_files(rpaths, inherit=False):
         """Recompile the given remote .c files in-game and report per-file: a
@@ -1062,6 +1077,10 @@ def cmd_connect(args):
         "     /push             upload everything    local → remote\r\n"
         "     /pull             download everything  remote → local\r\n"
         "\r\n"
+        "   Remove & rename on the MUD   (asks before it deletes anything)\r\n"
+        "     /rm f [..]        delete remote file(s) or empty dir(s)   (alias /del)\r\n"
+        "     /mv <src> <dst>   rename / move a remote file             (alias /rename)\r\n"
+        "\r\n"
         "   Build & test   (pushed .c files auto-reload; see /autoupdate)\r\n"
         "     /update [-o] f    recompile file(s) in-game; shows compile errors\r\n"
         "     /goto <file>      teleport into a room by its file\r\n"
@@ -1149,6 +1168,43 @@ def cmd_connect(args):
             state["autoupdate"] = (a[0] == "on") if a and a[0] in ("on", "off") \
                                   else not state["autoupdate"]
             out(f"\r\n  auto-update after push: {'on' if state['autoupdate'] else 'off'}\r\n")
+        elif cmd in ("/rm", "/del", "/delete"):
+            if not a: out("\r\n  usage: /rm <file|glob> [..]   (deletes on the MUD)\r\n"); return True
+            targets = []
+            for pat in a:
+                t = expand_remote_arg(mud, pat, state["rcwd"])
+                # expand_remote_arg only lists files for a glob; a plain name may be
+                # a directory, so resolve it directly and let file_size classify.
+                for rp in (t or [resolve_remote(pat, state["rcwd"])]):
+                    if rp not in targets: targets.append(rp)
+            existing = [(rp, mud.file_size(rp)) for rp in targets]
+            missing = [rp for rp, sz in existing if sz == -1]          # -1 = not found
+            live = [(rp, sz) for rp, sz in existing if sz >= 0 or sz == -2]  # file | dir
+            for rp in missing: out(f"\r\n  ✗ {rp}: not found on MUD")
+            if not live: out("\r\n"); return True
+            out("\r\n  about to DELETE on the MUD:\r\n")
+            for rp, sz in live:
+                out(f"    {rp}{'/  (dir)' if sz == -2 else ''}\r\n")
+            if not confirm_key(f"  delete {len(live)} item(s)? [y/N] ", default_yes=False):
+                out("  cancelled — nothing deleted.\r\n"); return True
+            done = 0
+            for rp, sz in live:
+                ok = mud.rmdir(rp) if sz == -2 else mud.rm(rp)
+                if ok: done += 1; out(f"    ✓ deleted {rp}\r\n")
+                else: out(f"    ✗ could not delete {rp}"
+                          f"{' (dir not empty?)' if sz == -2 else ''}\r\n")
+            out(f"  deleted {done}/{len(live)} item(s).\r\n")
+        elif cmd in ("/mv", "/rename", "/move"):
+            if len(a) != 2: out("\r\n  usage: /mv <src> <dst>   (renames a remote file)\r\n"); return True
+            src = resolve_remote(a[0], state["rcwd"]); dst = resolve_remote(a[1], state["rcwd"])
+            if mud.file_size(src) < 0: out(f"\r\n  ✗ {src}: not found on MUD\r\n"); return True
+            out(f"\r\n  move on the MUD:  {src}  →  {dst}\r\n")
+            if mud.file_size(dst) >= 0:
+                if not confirm_key(f"  {dst} exists — overwrite? [y/N] ", default_yes=False):
+                    out("  cancelled.\r\n"); return True
+                mud.rm(dst)                       # rename won't clobber, so clear it first
+            out(f"  ✓ moved to {dst}\r\n" if mud.rename(src, dst)
+                else "  ✗ move failed.\r\n")
         else:
             out(f"\r\n  unknown /command: {cmd}  (try /help)\r\n")
         return True
