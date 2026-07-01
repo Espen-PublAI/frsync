@@ -106,8 +106,13 @@ resolves every referenced path — room exits (`add_exit`), `inherit`,
 the area's `#define` path macros, and checks each target actually exists on the
 MUD. It reports broken references as `file:line  kind → /path`, so a mistyped
 exit or a room you renamed-but-forgot-to-repoint is caught before a player walks
-into it. Paths built from a runtime variable are skipped (can't be checked
-statically).
+into it.
+
+References it can't resolve statically — a path built from a runtime variable,
+or a macro defined outside the area (e.g. a standard mudlib path like `WEAPON`) —
+are **counted and skipped, never silently dropped**; run `/lint -v` to list them
+so you can confirm none hides a real reference. If a file uses an exit/load style
+`/lint` doesn't recognise, it says so rather than giving a false all-clear.
 
 A multi-file transfer runs through the files one at a time, advancing a
 **single overall progress bar** (total bytes across the whole batch, and which

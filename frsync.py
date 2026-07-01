@@ -1023,32 +1023,36 @@ def cmd_connect(args):
         out(f"\r\n  {len(changed)} changed · {len(new)} local-only · "
             f"{len(mud_only)} MUD-only · {same} in sync\r\n")
 
-    def do_lint(arg):
+    def do_lint(arg, verbose=False):
         """Validate an area: read its local .c source, resolve every referenced
         path (inherit / add_exit / clone_object / add_clone / load_object /
         find_object / #include) through the area's #define macros, and check each
         target exists on the MUD — catching broken exits and typos before players
-        do. Dynamic references (a variable path) are skipped."""
+        do. References whose path is a runtime variable or a macro defined outside
+        the area (e.g. a standard mudlib path) can't be resolved statically and
+        are skipped — listed with -v so you can confirm none hides a real bug."""
         root = state["local"] if not arg else os.path.abspath(os.path.join(state["local"], arg))
         if not os.path.isdir(root):
             out(f"\r\n  ✗ not a local folder: {root}\r\n"); return
         srcs = {}
         for rel in local_walk(root, [".c", ".h"]):
-            try: srcs[rel] = open(os.path.join(root, rel), encoding="utf-8", errors="replace").read()
+            try:
+                raw = open(os.path.join(root, rel), encoding="utf-8", errors="replace").read()
+                srcs[rel] = _strip_c_comments(raw)     # strip once; used for defines AND refs
             except OSError: pass
-        defines = collect_defines(srcs.values())
+        defines = collect_defines(srcs.values())       # comment-free, so trailing // can't break a macro
         cfiles = sorted(r for r in srcs if r.endswith(".c"))
         out(f"\r\n  linting {len(cfiles)} file(s) under {root} (targets checked on the MUD) …\r\n")
         cache, rc = {}, state["rcwd"].rstrip("/")
         def on_mud(p):
             if p not in cache: cache[p] = mud.file_size(p) >= 0
             return cache[p]
-        broken = checked = dynamic = 0
+        broken = checked = 0
+        skipped = []                                    # (rel, line, kind, expr) we couldn't resolve
         for rel in cfiles:
-            text = _strip_c_comments(srcs[rel])
-            for ref in extract_references(text, defines):
+            for ref in extract_references(srcs[rel], defines):
                 if ref["path"] is None:
-                    dynamic += 1; continue
+                    skipped.append((rel, ref["line"], ref["kind"], ref["expr"])); continue
                 checked += 1
                 if on_mud(ref["path"]): continue
                 broken += 1
@@ -1057,10 +1061,18 @@ def cmd_connect(args):
                     lp = os.path.join(state["local"], *ref["path"][len(rc) + 1:].split("/"))
                     hint = "  (exists locally — push it)" if os.path.isfile(lp) else ""
                 out(f"    ✗ {rel}:{ref['line']}  {ref['kind']} → {ref['path']}{hint}\r\n")
+        if verbose and skipped:
+            out("\r\n  skipped (couldn't resolve statically — verify by hand):\r\n")
+            for rel, line, kind, expr in skipped:
+                out(f"    ? {rel}:{line}  {kind} → {expr}\r\n")
         out(f"\r\n  {broken} broken reference(s) · {checked} checked"
-            + (f" · {dynamic} dynamic (skipped)" if dynamic else "") + "\r\n")
-        if not broken:
-            out("  ✓ every reference resolves on the MUD.\r\n")
+            + (f" · {len(skipped)} skipped{'' if verbose else ' (use /lint -v to see them)'}"
+               if skipped else "") + "\r\n")
+        if checked == 0:
+            out("  ⚠ nothing was checkable — is this an area folder? (lint knows "
+                "add_exit/inherit/clone/load/#include)\r\n")
+        elif not broken:
+            out("  ✓ every checked reference resolves on the MUD.\r\n")
 
     def upload_local_files(paths):
         """Push a list of local files to the current remote folder, one batch
@@ -1179,7 +1191,8 @@ def cmd_connect(args):
         "     /update [-o] f    recompile file(s) in-game; shows compile errors\r\n"
         "     /goto <file>      teleport into a room by its file\r\n"
         "     /clone <file>     clone an object to test it\r\n"
-        "     /lint [dir]       check the area's exits/inherits/loads resolve on the MUD\r\n"
+        "     /lint [dir] [-v]  check the area's exits/inherits/loads resolve on the\r\n"
+        "                       MUD; -v also lists references it couldn't resolve\r\n"
         "     /errors [n|all]   show the last n lines of your MUD error log\r\n"
         "     /autoupdate on|off  toggle auto-reload after each push\r\n"
         "\r\n"
@@ -1237,7 +1250,9 @@ def cmd_connect(args):
         elif cmd == "/push": do_sync("up")
         elif cmd == "/pull": do_sync("down")
         elif cmd == "/lint":
-            do_lint(a[0] if a else None)
+            verbose = any(x in ("-v", "--verbose") for x in a)
+            dirs = [x for x in a if not x.startswith("-")]
+            do_lint(dirs[0] if dirs else None, verbose=verbose)
         elif cmd == "/diff":
             if not a:
                 diff_all()                     # no args → diff the whole folder tree
