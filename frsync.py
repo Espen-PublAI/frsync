@@ -1023,6 +1023,45 @@ def cmd_connect(args):
         out(f"\r\n  {len(changed)} changed · {len(new)} local-only · "
             f"{len(mud_only)} MUD-only · {same} in sync\r\n")
 
+    def do_lint(arg):
+        """Validate an area: read its local .c source, resolve every referenced
+        path (inherit / add_exit / clone_object / add_clone / load_object /
+        find_object / #include) through the area's #define macros, and check each
+        target exists on the MUD — catching broken exits and typos before players
+        do. Dynamic references (a variable path) are skipped."""
+        root = state["local"] if not arg else os.path.abspath(os.path.join(state["local"], arg))
+        if not os.path.isdir(root):
+            out(f"\r\n  ✗ not a local folder: {root}\r\n"); return
+        srcs = {}
+        for rel in local_walk(root, [".c", ".h"]):
+            try: srcs[rel] = open(os.path.join(root, rel), encoding="utf-8", errors="replace").read()
+            except OSError: pass
+        defines = collect_defines(srcs.values())
+        cfiles = sorted(r for r in srcs if r.endswith(".c"))
+        out(f"\r\n  linting {len(cfiles)} file(s) under {root} (targets checked on the MUD) …\r\n")
+        cache, rc = {}, state["rcwd"].rstrip("/")
+        def on_mud(p):
+            if p not in cache: cache[p] = mud.file_size(p) >= 0
+            return cache[p]
+        broken = checked = dynamic = 0
+        for rel in cfiles:
+            text = _strip_c_comments(srcs[rel])
+            for ref in extract_references(text, defines):
+                if ref["path"] is None:
+                    dynamic += 1; continue
+                checked += 1
+                if on_mud(ref["path"]): continue
+                broken += 1
+                hint = ""
+                if ref["path"].startswith(rc + "/"):     # inside this area?
+                    lp = os.path.join(state["local"], *ref["path"][len(rc) + 1:].split("/"))
+                    hint = "  (exists locally — push it)" if os.path.isfile(lp) else ""
+                out(f"    ✗ {rel}:{ref['line']}  {ref['kind']} → {ref['path']}{hint}\r\n")
+        out(f"\r\n  {broken} broken reference(s) · {checked} checked"
+            + (f" · {dynamic} dynamic (skipped)" if dynamic else "") + "\r\n")
+        if not broken:
+            out("  ✓ every reference resolves on the MUD.\r\n")
+
     def upload_local_files(paths):
         """Push a list of local files to the current remote folder, one batch
         bar, overwrite prompt per existing file. Shared by /upload and the
@@ -1140,6 +1179,7 @@ def cmd_connect(args):
         "     /update [-o] f    recompile file(s) in-game; shows compile errors\r\n"
         "     /goto <file>      teleport into a room by its file\r\n"
         "     /clone <file>     clone an object to test it\r\n"
+        "     /lint [dir]       check the area's exits/inherits/loads resolve on the MUD\r\n"
         "     /errors [n|all]   show the last n lines of your MUD error log\r\n"
         "     /autoupdate on|off  toggle auto-reload after each push\r\n"
         "\r\n"
@@ -1196,6 +1236,8 @@ def cmd_connect(args):
             upload_local_files(paths)
         elif cmd == "/push": do_sync("up")
         elif cmd == "/pull": do_sync("down")
+        elif cmd == "/lint":
+            do_lint(a[0] if a else None)
         elif cmd == "/diff":
             if not a:
                 diff_all()                     # no args → diff the whole folder tree
@@ -1801,6 +1843,130 @@ def colorize_diff(line, tty=True):
     if line.startswith("-"):  return f"\x1b[31m{line}\x1b[0m"
     if line.startswith("@@"): return f"\x1b[36m{line}\x1b[0m"
     return line
+
+# ---------------------------------------------------------------- area lint
+# Verify that the paths an area's LPC code references (room exits, inherits,
+# clone/load targets, includes) actually resolve to a file — catching broken
+# exits and typos before players hit them. Paths are usually #define macros or
+# macro+"literal" expressions, so we build a define table and evaluate them.
+
+_DEFINE_RX = re.compile(r'^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+(.+?)[ \t]*$', re.M)
+
+def collect_defines(texts):
+    """Build {NAME: raw_value} from #define lines across the given file texts.
+    Object-like macros only (a name followed by '(' is function-like — skipped).
+    First definition of a name wins."""
+    out = {}
+    for t in texts:
+        for name, val in _DEFINE_RX.findall(t):
+            out.setdefault(name, val.strip())
+    return out
+
+def _split_top(s, sep):
+    """Split `s` on single-char `sep` at paren/bracket depth 0, outside strings."""
+    parts, buf, depth, instr, esc = [], [], 0, False, False
+    for c in s:
+        if instr:
+            buf.append(c)
+            if esc: esc = False
+            elif c == "\\": esc = True
+            elif c == '"': instr = False
+            continue
+        if c == '"': instr = True; buf.append(c); continue
+        if c in "([{": depth += 1
+        elif c in ")]}": depth -= 1
+        if c == sep and depth == 0: parts.append("".join(buf)); buf = []
+        else: buf.append(c)
+    parts.append("".join(buf))
+    return parts
+
+def _strip_parens(e):
+    e = e.strip()
+    while e.startswith("(") and e.endswith(")"):
+        depth = 0; ok = True
+        for i, c in enumerate(e):
+            if c == "(": depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0 and i != len(e) - 1: ok = False; break
+        if ok: e = e[1:-1].strip()
+        else: break
+    return e
+
+def eval_str_expr(expr, defines, _depth=0):
+    """Evaluate an LPC string expression built from "literals" and #define names
+    joined by '+' (with parens), expanding macros recursively. Returns the string,
+    or None if any part is a variable/function/unknown macro (i.e. not resolvable
+    statically)."""
+    if _depth > 25: return None
+    expr = _strip_parens(expr)
+    if not expr: return None
+    out = []
+    for p in _split_top(expr, "+"):
+        p = p.strip()
+        if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+            out.append(p[1:-1])
+        elif re.fullmatch(r"[A-Za-z_]\w*", p) and p in defines:
+            sub = eval_str_expr(defines[p], defines, _depth + 1)
+            if sub is None: return None
+            out.append(sub)
+        else:
+            return None
+    return "".join(out)
+
+def _strip_c_comments(text):
+    """Drop /*…*/ and //… comments so commented-out or prose references aren't
+    linted. Block comments become equal newlines so line numbers stay accurate."""
+    text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group().count("\n"), text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+def _find_calls(text, funcname):
+    """Yield (args, offset) for each funcname(...) call — args is the top-level
+    comma-split argument list (raw strings), offset is where the call starts."""
+    for m in re.finditer(r"\b" + re.escape(funcname) + r"\s*\(", text):
+        depth, j, instr, esc = 1, m.end(), False, False
+        while j < len(text) and depth:
+            c = text[j]
+            if instr:
+                if esc: esc = False
+                elif c == "\\": esc = True
+                elif c == '"': instr = False
+            elif c == '"': instr = True
+            elif c == "(": depth += 1
+            elif c == ")": depth -= 1
+            j += 1
+        yield _split_top(text[m.end():j - 1], ","), m.start()
+
+# (function, argument index) for each call whose arg names a file.
+_REF_CALLS = [("add_exit", 1), ("clone_object", 0), ("add_clone", 0),
+              ("load_object", 0), ("find_object", 0)]
+
+def extract_references(text, defines):
+    """Find file references in one (comment-stripped) LPC source. Returns a list
+    of {kind, expr, path, line}: `path` is the resolved target normalised to a
+    real '<base>.c' file (FR omits .c on some inherits/loads), or None when the
+    expression can't be resolved statically (a variable — skipped by the linter)."""
+    refs = []
+    def add(kind, expr, off):
+        resolved = eval_str_expr(expr, defines)
+        path = None
+        if resolved and resolved.startswith("/"):
+            base = resolved[:-2] if resolved.endswith(".c") else resolved.rstrip("/")
+            path = base + ".c"
+        refs.append({"kind": kind, "expr": expr.strip(),
+                     "path": path, "line": text.count("\n", 0, off) + 1})
+    for m in re.finditer(r"\binherit\s+([^;{]+);", text):
+        add("inherit", m.group(1), m.start())
+    for fn, idx in _REF_CALLS:
+        for args, off in _find_calls(text, fn):
+            if len(args) > idx and args[idx].strip():
+                add("exit" if fn == "add_exit" else fn, args[idx], off)
+    for m in re.finditer(r'#\s*include\s+"([^"]+)"', text):
+        p = m.group(1)
+        refs.append({"kind": "include", "expr": p,
+                     "path": p if p.startswith("/") else None,
+                     "line": text.count("\n", 0, m.start()) + 1})
+    return refs
 
 def show_plan(states, mode):
     order = ["new", "diff", "remote_only", "same"]
