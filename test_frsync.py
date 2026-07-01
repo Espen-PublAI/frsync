@@ -379,6 +379,56 @@ def test_lint_custom_exit_wrapper():
     assert not frsync._is_param_decl("DF_DREAM05") and not frsync._is_param_decl('"north"')
 
 
+def test_lineeditor_autocomplete():
+    cmds = ["/upload", "/download", "/push", "/pull", "/diff", "/put"]
+    writes = []
+    ed = frsync.LineEditor(lambda s: writes.append(s), lambda l: True, commands=cmds)
+
+    # the hint narrows as the /prefix grows, and vanishes once unambiguous/spaced
+    ed.buf = list("/p")
+    assert set(ed._matches()) == {"/push", "/pull", "/put"}
+    assert "/push" in ed._hint() and "/pull" in ed._hint()
+    ed.buf = list("/pu");  assert ed._hint()  # /push /pull /put still
+    ed.buf = list("/dif"); assert ed._hint() == "  /diff"          # single candidate shown
+    ed.buf = list("/diff"); assert ed._hint() == ""                # exact -> nothing to add
+    ed.buf = list("/diff x"); assert ed._hint() == ""              # past the command -> off
+    ed.buf = list("look");   assert ed._hint() == "" and ed._matches() == []
+
+    # a keystroke repaints buffer + dim hint and parks the cursor after the buffer
+    writes.clear(); ed.buf = list("/d"); ed.key("text", "o")
+    painted = writes[-1]
+    assert painted.startswith("\r\x1b[K/do")     # line cleared, buffer shown
+    assert "\x1b[90m" in painted                  # dim hint follows
+    assert painted.endswith("D")                  # cursor moved back left over the hint
+
+    # Tab: unique match completes and appends a space for args
+    ed.buf = list("/dif"); ed.key("tab"); assert "".join(ed.buf) == "/diff "
+    # Tab: several matches -> extend to the common prefix only
+    ed.buf = list("/d"); ed.key("tab"); assert "".join(ed.buf) == "/d"      # /download vs /diff -> "/d"
+    ed.buf = list("/pu"); ed.key("tab"); assert "".join(ed.buf) == "/pu"    # /push/pull/put
+    # Tab on a non-command line does nothing
+    ed.buf = list("kill orc"); ed.key("tab"); assert "".join(ed.buf) == "kill orc"
+
+    # --- argument completion (Tab on a file-name arg via arg_completer) ---
+    def completer(cmd, partial):
+        pool = {"/upload": ["area.c", "rooms/", "obj/"],
+                "/download": ["clearing.c", "clone_helper.c", "hut.c"]}.get(cmd, [])
+        d, _, base = partial.rpartition("/")
+        return sorted(p for p in pool if p.startswith(base))
+    ed2 = frsync.LineEditor(lambda s: None, lambda l: True,
+                            commands=cmds + ["/upload", "/download"], arg_completer=completer)
+    # unique file -> fill in + trailing space (ready for the next arg)
+    ed2.buf = list("/upload ar"); ed2.key("tab"); assert "".join(ed2.buf) == "/upload area.c "
+    # a directory candidate keeps its slash and gets NO space (keep descending)
+    ed2.buf = list("/upload ro"); ed2.key("tab"); assert "".join(ed2.buf) == "/upload rooms/"
+    # several candidates -> extend to common prefix, and show them in the strip
+    ed2.buf = list("/download cl"); ed2.key("tab")
+    assert "".join(ed2.buf) == "/download cl"                 # "clearing"/"clone_helper" share "cl"
+    assert ed2._suggest == ["clearing.c", "clone_helper.c"]
+    # the candidate strip is transient — cleared by the next keystroke
+    ed2.key("text", "e"); assert ed2._suggest is None
+
+
 def test_unified_diff_lines():
     # MUD copy is the 'before', local is the 'after': + is what a push would
     # apply, - is MUD-only content (e.g. a live `ed` edit that drifted).
@@ -494,6 +544,7 @@ def main():
         ("unified diff local vs MUD",                lambda: test_unified_diff_lines()),
         ("area lint: macros + references",           lambda: test_area_lint_parsing()),
         ("area lint: custom exit wrapper",           lambda: test_lint_custom_exit_wrapper()),
+        ("line editor autocomplete + hint",          lambda: test_lineeditor_autocomplete()),
     ]
     failed = 0
     for name, fn in tests:
