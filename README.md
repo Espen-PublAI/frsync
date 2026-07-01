@@ -64,6 +64,7 @@ for moving files:
 | `/download <f> [..]` | fetch remote file(s) → this computer |
 | `/push`              | mirror the **whole** local folder tree → remote (recursive) |
 | `/pull`              | mirror the **whole** remote folder tree → local (recursive) |
+| `/diff [file\|glob]` | unified diff local vs the MUD — *what* differs (catches live `ed` edits). No args diffs the **whole folder** (only changed files shown); `*.c` globs too |
 | `/rm <f> [..]`       | delete remote file(s)/empty dir(s) — **asks first**, default no (alias `/del`) |
 | `/mv <src> <dst>`    | rename / move a remote file (alias `/rename`) |
 | `/update [-o] <f>`   | recompile file(s) in-game; prints compile errors as `file:line: msg` |
@@ -136,7 +137,7 @@ directory (directories sync recursively). Every `push`/`pull` is **verified**
 | `status` | compare            | Show what differs between local and MUD. Changes nothing.    |
 | `push`   | local → MUD        | Upload, verified. Asks before writing.                       |
 | `pull`   | MUD → local        | Download, verified.                                          |
-| `watch`  | local → MUD (live) | Auto-upload files as you save/drop them into a folder.       |
+| `watch`  | local → MUD (live) | Auto-upload files as you save/drop them, then **auto-reload each .c in-game** (compile errors shown). `--no-update` to just push. |
 | `mirror` | MUD → local (bulk) | Download whole subtrees for a local working copy. Resumable. |
 
 ```bash
@@ -152,7 +153,7 @@ python3 frsync.py pull /w/<creator>/drifting_forest ./backup
 # bulk-download whole server subtrees into ./MUD (resumable — re-run to continue)
 python3 frsync.py mirror ./MUD /std /d /w/<creator>
 
-# "synced folder": auto-push a local dir as files change
+# "synced folder": auto-push a local dir as files change, reloading each in-game
 python3 frsync.py watch ./myarea /w/<creator>/myarea
 ```
 
@@ -165,7 +166,9 @@ python3 frsync.py status ./myarea /w/<creator>/myarea   # check what changed
 python3 frsync.py push   ./myarea /w/<creator>/myarea   # ship it (verified)
 ```
 
-…or just leave `watch` running and every save uploads automatically.
+…or just leave `watch` running: every save uploads **and reloads the object
+in-game**, printing any compile error as `file:line: message` — the full
+edit→save→reload loop with no MUD-window typing.
 
 **Flags:**
 

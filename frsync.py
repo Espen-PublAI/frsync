@@ -34,7 +34,7 @@ OPTIONS
 Password: read from $FRPASS if set, otherwise prompted (never stored).
 Pure Python 3 standard library — one file, share it freely.
 """
-import argparse, fnmatch, getpass, glob, os, queue, re, select, shlex, socket, sys, threading, time, zlib
+import argparse, difflib, fnmatch, getpass, glob, os, queue, re, select, shlex, socket, sys, threading, time, zlib
 try:
     import termios, tty          # POSIX-only; absent on Windows
 except ImportError:
@@ -970,6 +970,59 @@ def cmd_connect(args):
             out("  (no recent errors — just tool exec noise; /errors all to see it)\r\n"); return
         for ln in lines: out("  " + ln + "\r\n")
 
+    def _emit_diff(label, lp, rp, rsz, tty):
+        """Print the unified diff of one existing-both-sides file. Returns False
+        (and prints nothing) if the two copies are byte-identical after norm."""
+        ltext = local_norm(open(lp, "rb").read()).decode("utf-8", "replace")
+        rtext = local_norm(mud.read_file_bytes(rp, rsz)).decode("utf-8", "replace")
+        if ltext == rtext:
+            return False
+        out("\r\n")
+        for ln in unified_diff_lines(rtext, ltext, label):
+            out("  " + colorize_diff(ln, tty) + "\r\n")
+        return True
+
+    def show_diff(arg):
+        """Show a unified diff of one file: your local copy vs the copy live on
+        the MUD. '+' is what a push would apply, '-' is MUD-only content (drift)."""
+        lp = arg if os.path.isabs(arg) else os.path.join(state["local"], arg)
+        rp = resolve_remote(arg, state["rcwd"])
+        label = arg.replace(os.sep, "/")
+        l_ok = os.path.isfile(lp)
+        rsz = mud.file_size(rp)
+        if not l_ok and rsz < 0:
+            out(f"\r\n  ✗ {arg}: not found locally or on the MUD\r\n")
+        elif rsz < 0:
+            out(f"\r\n  {label}: only local — not on the MUD yet (/upload to push it)\r\n")
+        elif not l_ok:
+            out(f"\r\n  {label}: only on the MUD — no local copy (/download to fetch it)\r\n")
+        elif not _emit_diff(label, lp, rp, rsz, sys.stdout.isatty()):
+            out(f"\r\n  {label}: identical — local and MUD are in sync\r\n")
+
+    def diff_all():
+        """Collectively diff the whole current local folder against the remote
+        folder (recursive). Uses plan() (size+CRC) so only files that actually
+        differ are fetched and shown; local-only and MUD-only files are listed,
+        not dumped."""
+        lroot, rroot = state["local"], state["rcwd"]
+        out(f"\r\n  scanning {lroot}  vs  {rroot} …\r\n")
+        st = plan(mud, lroot, rroot, [], is_file=False)
+        changed = sorted(r for r, s in st.items() if s == "diff")
+        new = sorted(r for r, s in st.items() if s == "new")
+        mud_only = sorted(r for r, s in st.items() if s == "remote_only")
+        same = sum(1 for s in st.values() if s == "same")
+        if not (changed or new or mud_only):
+            out(f"  in sync — {same} file(s) match.\r\n"); return
+        tty = sys.stdout.isatty()
+        for rel in changed:
+            lp = os.path.join(lroot, *rel.split("/"))
+            rp = f"{rroot}/{rel.replace(os.sep, '/')}"
+            _emit_diff(rel.replace(os.sep, "/"), lp, rp, mud.file_size(rp), tty)
+        if new:      out(f"\r\n  only local (not on MUD): {', '.join(new)}\r\n")
+        if mud_only: out(f"  only on MUD (not local): {', '.join(mud_only)}\r\n")
+        out(f"\r\n  {len(changed)} changed · {len(new)} local-only · "
+            f"{len(mud_only)} MUD-only · {same} in sync\r\n")
+
     def upload_local_files(paths):
         """Push a list of local files to the current remote folder, one batch
         bar, overwrite prompt per existing file. Shared by /upload and the
@@ -1076,6 +1129,8 @@ def cmd_connect(args):
         "   Sync a whole folder tree   (recursive: every file + subfolder)\r\n"
         "     /push             upload everything    local → remote\r\n"
         "     /pull             download everything  remote → local\r\n"
+        "     /diff [file|glob] what differs between local and the MUD; no args\r\n"
+        "                       diffs the whole folder (only changed files shown)\r\n"
         "\r\n"
         "   Remove & rename on the MUD   (asks before it deletes anything)\r\n"
         "     /rm f [..]        delete remote file(s) or empty dir(s)   (alias /del)\r\n"
@@ -1141,6 +1196,18 @@ def cmd_connect(args):
             upload_local_files(paths)
         elif cmd == "/push": do_sync("up")
         elif cmd == "/pull": do_sync("down")
+        elif cmd == "/diff":
+            if not a:
+                diff_all()                     # no args → diff the whole folder tree
+            else:
+                for arg in a:
+                    if _has_glob(arg):         # e.g. /diff *.c → diff each local match
+                        rels = [os.path.relpath(p, state["local"])
+                                for p in expand_local_arg(state["local"], arg)]
+                        if not rels: out(f"\r\n  ✗ {arg}: no local files match\r\n")
+                        for rel in rels: show_diff(rel)
+                    else:
+                        show_diff(arg)
         elif cmd == "/update":
             inherit = bool(a) and a[0] in ("-o", "--inherit")
             names = a[1:] if inherit else a
@@ -1452,15 +1519,38 @@ def push_one(mud, lp, rp, made, progress=None):
     mud.write_file_chunks(rp, data, progress=progress)
     return verify_remote(mud, rp, data)
 
+def watch_reload(mud, cfiles):
+    """Recompile the pushed .c files in-game and print the outcome — compile
+    errors as file:line: message, else a reloaded count. Used by `watch` so a
+    save reloads the object live. Indented under the ↑ upload lines."""
+    if not cfiles:
+        return
+    try:
+        res = mud.update(cfiles)
+    except Exception as e:
+        print(f"           ✗ update failed: {str(e)[:60]}"); return
+    bad = {p for p, _, _ in res["errors"]} | set(res["failed"])
+    for p, ln, msg in res["errors"]:
+        print(f"           ✗ {os.path.basename(p)}:{ln}: {msg}")
+    for p in res["failed"]:
+        print(f"           ✗ {os.path.basename(p)}: failed to load")
+    good = len(cfiles) - len(bad)
+    if good:
+        print(f"           ⟳ reloaded {good} file(s)")
+
 def cmd_watch(args):
     """Watch a local dir and auto-push files as they're saved/dropped in —
     the closest thing to a 'synced folder'. Only files that change AFTER
     start are pushed (run `push` first to sync what's already there).
+    Each pushed .c is then recompiled in-game (update) and any compile error is
+    printed as file:line: message — so save-in-editor reloads the object live,
+    with no MUD-window typing. Pass --no-update to push without reloading.
     Server files are never deleted."""
     mud = connect(args)
     local = os.path.abspath(args.local)
     remote = args.remote.rstrip("/")
     exts = parse_exts(args.ext)
+    auto_update = not getattr(args, "no_update", False)
     made = set()
 
     def scan():
@@ -1475,7 +1565,8 @@ def cmd_watch(args):
 
     baseline = scan()
     print(f"Watching {local}  ->  {remote}")
-    print(f"  ({len(baseline)} files baselined; drop or save files here to upload. Ctrl-C to stop.)\n")
+    print(f"  ({len(baseline)} files baselined; save/drop files here to upload"
+          f"{' + auto-reload' if auto_update else ''}. Ctrl-C to stop.)\n")
     last_ping = time.time()
     try:
         while True:
@@ -1483,15 +1574,19 @@ def cmd_watch(args):
             cur = scan()
             changed = [rel for rel, sig in cur.items() if baseline.get(rel) != sig]
             if changed:
+                pushed = []
                 for rel in sorted(changed):
                     lp = os.path.join(local, rel)
                     rp = f"{remote}/{rel}"
+                    ts = time.strftime("%H:%M:%S")
                     try:
                         ok = push_one(mud, lp, rp, made)
-                        ts = time.strftime("%H:%M:%S")
                         print(f"  [{ts}] {'OK ' if ok else 'FAIL'}  ↑ {rel}")
+                        if ok: pushed.append(rp)
                     except Exception as e:
-                        print(f"  FAIL ↑ {rel}: {str(e)[:80]}")
+                        print(f"  [{ts}] FAIL ↑ {rel}: {str(e)[:80]}")
+                if auto_update:
+                    watch_reload(mud, [p for p in pushed if p.endswith(".c")])
                 baseline = cur
                 last_ping = time.time()
             elif time.time() - last_ping > 45:
@@ -1688,6 +1783,25 @@ def parse_update_output(text):
     loaded = _UPD_LOAD.findall(text) + _UPD_UPD.findall(text)
     return {"errors": errors, "failed": failed, "loaded": loaded}
 
+def unified_diff_lines(remote_text, local_text, label):
+    """Unified diff with the MUD copy as the 'before' and your local copy as the
+    'after' — so a '+' line is what your local would push and a '-' line is what's
+    live on the MUD but missing locally (e.g. someone edited it with `ed`).
+    Returns a list of lines with no trailing newlines (empty if identical)."""
+    return list(difflib.unified_diff(
+        remote_text.splitlines(), local_text.splitlines(),
+        fromfile=f"{label} (MUD)", tofile=f"{label} (local)", lineterm=""))
+
+def colorize_diff(line, tty=True):
+    """Colour one unified-diff line for a terminal (headers bold, +green, -red,
+    @@ cyan); returns it unchanged when not a tty."""
+    if not tty: return line
+    if line.startswith(("+++", "---")): return f"\x1b[1m{line}\x1b[0m"   # file headers
+    if line.startswith("+"):  return f"\x1b[32m{line}\x1b[0m"
+    if line.startswith("-"):  return f"\x1b[31m{line}\x1b[0m"
+    if line.startswith("@@"): return f"\x1b[36m{line}\x1b[0m"
+    return line
+
 def show_plan(states, mode):
     order = ["new", "diff", "remote_only", "same"]
     label = {"new": "new (local only)", "diff": "differs",
@@ -1762,6 +1876,7 @@ def main():
     sp.add_argument("local", help="local directory to watch")
     sp.add_argument("remote", help="server directory to upload into")
     sp.add_argument("--interval", type=float, default=2.0, help="poll seconds (default 2)")
+    sp.add_argument("--no-update", action="store_true", help="just push; don't recompile (update) each pushed .c in-game")
     sp = sub.add_parser("connect", parents=[common], help="interactive MUD shell with /download and /upload")
     sp.add_argument("--dir", help="initial local folder for transfers (default: current dir)")
     mp = sub.add_parser("mirror", parents=[common], help="bulk-download server subtrees, resumable")

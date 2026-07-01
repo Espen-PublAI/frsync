@@ -305,6 +305,26 @@ def test_recursive_plan_with_subfolders(tmpdir):
     assert todo == ["area.c", "rooms/hut.c"]
 
 
+def test_unified_diff_lines():
+    # MUD copy is the 'before', local is the 'after': + is what a push would
+    # apply, - is MUD-only content (e.g. a live `ed` edit that drifted).
+    remote = "look = \"a forest\";\nexits = ([\"north\":ROOM+\"hut\"]);\n"
+    local  = "look = \"a misty forest\";\nexits = ([\"north\":ROOM+\"hut\"]);\n"
+    d = frsync.unified_diff_lines(remote, local, "clearing.c")
+    assert d[0] == "--- clearing.c (MUD)"
+    assert d[1] == "+++ clearing.c (local)"
+    assert '-look = "a forest";' in d
+    assert '+look = "a misty forest";' in d
+    assert '  exits = (["north":ROOM+"hut"]);'.strip() in [x.strip() for x in d]  # context kept
+    # identical files -> empty diff (the "in sync" case)
+    assert frsync.unified_diff_lines("x\ny", "x\ny", "f") == []
+    # colouring: + green, - red, headers bold; plain passthrough when not a tty
+    assert frsync.colorize_diff("+add", True).startswith("\x1b[32m")
+    assert frsync.colorize_diff("-del", True).startswith("\x1b[31m")
+    assert frsync.colorize_diff("--- f (MUD)", True).startswith("\x1b[1m")
+    assert frsync.colorize_diff("+add", False) == "+add"
+
+
 def test_delete_rename_return_codes():
     # The subtle bit: rm()/rmdir() return 1 on success, but rename() returns 0 on
     # success (verified live on FR:Legacy). The Mud wrappers must map each to bool
@@ -397,6 +417,7 @@ def main():
         ("recursive plan across subfolders",         lambda: test_recursive_plan_with_subfolders(tmp)),
         ("parse update/reload output",               lambda: test_parse_update_output()),
         ("delete/rename return codes",               lambda: test_delete_rename_return_codes()),
+        ("unified diff local vs MUD",                lambda: test_unified_diff_lines()),
     ]
     failed = 0
     for name, fn in tests:
