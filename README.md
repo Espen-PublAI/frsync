@@ -70,6 +70,7 @@ for moving files:
 | `/update [-o] <f>`   | recompile file(s) in-game; prints compile errors as `file:line: msg` |
 | `/goto <file>`       | teleport into a room by its file |
 | `/clone <file>`      | clone an object to test it |
+| `/lint [dir]`        | check the area's exits/inherits/clone+load targets/includes resolve on the MUD — catches broken exits before players do |
 | `/errors [n\|all]`   | tail your MUD error log (runtime + compile errors) |
 | `/autoupdate on\|off`| toggle auto-reload after each push (**on** by default) |
 | `/where`             | show your current local + remote folders |
@@ -98,6 +99,15 @@ window. Then `/goto rooms/hut` to stand in the room, `/clone obj/torch` to test
 an object, and `/errors` to read runtime errors. Turn the auto-reload off with
 `/autoupdate off` (then reload by hand with `/update`, `-o` to update an inherit
 chain when you changed a base or `.h`).
+
+**Validate the whole area** with `/lint`: it reads your local `.c` source,
+resolves every referenced path — room exits (`add_exit`), `inherit`,
+`clone_object`/`add_clone`, `load_object`/`find_object`, and `#include` — through
+the area's `#define` path macros, and checks each target actually exists on the
+MUD. It reports broken references as `file:line  kind → /path`, so a mistyped
+exit or a room you renamed-but-forgot-to-repoint is caught before a player walks
+into it. Paths built from a runtime variable are skipped (can't be checked
+statically).
 
 A multi-file transfer runs through the files one at a time, advancing a
 **single overall progress bar** (total bytes across the whole batch, and which

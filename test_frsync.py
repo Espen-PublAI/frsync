@@ -305,6 +305,49 @@ def test_recursive_plan_with_subfolders(tmpdir):
     assert todo == ["area.c", "rooms/hut.c"]
 
 
+def test_area_lint_parsing():
+    # Real Drifting Forest conventions: #define path macros built by +, and the
+    # FR quirk that some inherits/loads omit the .c (the file on disk is X.c).
+    paths_h = (
+        '#define DF_AREA "/w/malric/drifting_forest/"\n'
+        '#define DF_ROOMS   (DF_AREA + "rooms/")\n'
+        '#define DF_OBJ     (DF_AREA + "obj/")\n'
+        '#define DF_HUT     (DF_ROOMS + "hut.c")\n'
+        '#define DF_HUT_ROOM (DF_ROOMS + "hut")\n'          # no .c -> load form
+        '#define DF_ROOM_BASE "/std/rooms/room"\n'          # no .c -> real file is .c
+        '#define DF_DUSKROOT (DF_OBJ + "duskroot.c")\n')
+    defs = frsync.collect_defines([paths_h])
+    assert defs["DF_AREA"] == '"/w/malric/drifting_forest/"'
+    assert frsync.eval_str_expr("DF_HUT", defs) == "/w/malric/drifting_forest/rooms/hut.c"
+    assert frsync.eval_str_expr('DF_ROOMS + "x.c"', defs) == "/w/malric/drifting_forest/rooms/x.c"
+    assert frsync.eval_str_expr("this_object()", defs) is None      # dynamic -> unresolved
+    assert frsync.eval_str_expr("some_var", defs) is None
+
+    src = (
+        '#include "/w/malric/drifting_forest/rooms/df_local.h"\n'
+        "inherit DF_ROOM_BASE;\n"
+        "void setup() {\n"
+        '  add_exit("in", DF_HUT, "door");\n'
+        '  add_exit("hub", "/w/malric/dev_hub/rooms/nexus.c", "portal");\n'
+        "  add_clone(DF_HUT_ROOM, 1);\n"
+        "}\n"
+        "int go(string p) { return clone_object(p); }  // dynamic: skipped\n"
+        "/* prose: add_exit(x, DF_ROOMS + \"ghost.c\") must be ignored */\n")
+    refs = frsync.extract_references(frsync._strip_c_comments(src), defs)
+    by = {(r["kind"], r["line"]): r["path"] for r in refs}
+    # inherit "/std/rooms/room" normalises to the real .c file
+    assert by[("inherit", 2)] == "/std/rooms/room.c"
+    assert by[("exit", 4)] == "/w/malric/drifting_forest/rooms/hut.c"
+    assert by[("exit", 5)] == "/w/malric/dev_hub/rooms/nexus.c"
+    # add_clone target is a no-.c macro -> resolves to the .c file on disk
+    assert by[("add_clone", 6)] == "/w/malric/drifting_forest/rooms/hut.c"
+    assert by[("include", 1)] == "/w/malric/drifting_forest/rooms/df_local.h"
+    # the clone_object(p) variable is unresolved (path None), the commented
+    # add_exit in the /* */ block is stripped and never seen
+    assert any(r["kind"] == "clone_object" and r["path"] is None for r in refs)
+    assert not any("ghost.c" in (r["path"] or "") for r in refs)
+
+
 def test_unified_diff_lines():
     # MUD copy is the 'before', local is the 'after': + is what a push would
     # apply, - is MUD-only content (e.g. a live `ed` edit that drifted).
@@ -418,6 +461,7 @@ def main():
         ("parse update/reload output",               lambda: test_parse_update_output()),
         ("delete/rename return codes",               lambda: test_delete_rename_return_codes()),
         ("unified diff local vs MUD",                lambda: test_unified_diff_lines()),
+        ("area lint: macros + references",           lambda: test_area_lint_parsing()),
     ]
     failed = 0
     for name, fn in tests:
