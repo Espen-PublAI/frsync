@@ -852,37 +852,122 @@ class LineEditor:
     Shared by the POSIX (termios) and Windows (msvcrt) raw-mode loops, which
     differ only in how they READ keys — both translate a keystroke into one
     `key()` call. The cooked fallback uses only `echo_output` (its buffer stays
-    empty) and submits whole lines itself."""
-    def __init__(self, write, submit):
+    empty) and submits whole lines itself.
+
+    When the line begins with '/', a dim list of matching commands is shown after
+    the cursor and narrows as you type. Tab completes: on the command word it
+    fills a unique match (or extends to the common prefix); on an argument it asks
+    `arg_completer(cmd, partial)` for file names and completes those, showing the
+    candidates in the dim strip."""
+    def __init__(self, write, submit, commands=None, arg_completer=None):
         self._write = write       # out(str) -> None
         self._submit = submit     # handle_line(str) -> bool  (False = quit)
+        self.commands = commands or []          # "/foo" names for autocomplete
+        self._arg_completer = arg_completer     # (cmd, partial) -> [candidate, …]
         self.buf = []             # chars of the line being typed
         self.history = []         # submitted lines, oldest first (Up/Down recalls)
         self.hidx = 0             # cursor into history; == len means the live line
         self.pending = ""         # live line stashed while scrolling up
+        self._suggest = None      # transient arg candidates to show (set by Tab)
+
+    def _matches(self):
+        """Commands that complete the current (space-free) /prefix, else []."""
+        line = "".join(self.buf)
+        if not line.startswith("/") or " " in line:
+            return []
+        return [c for c in self.commands if c.startswith(line)]
+
+    @staticmethod
+    def _strip(items):
+        """A width-bounded, dim-strip-ready join of `items` (so the line can't
+        wrap): '  a  b  c' plus '  …' when the list was truncated."""
+        shown = []
+        for c in items:
+            if sum(len(x) + 2 for x in shown) + len(c) > 56:
+                break
+            shown.append(c)
+        return "  " + "  ".join(shown) + ("  …" if len(shown) < len(items) else "")
+
+    def _hint(self):
+        """The dim suggestion strip shown after the cursor: transient argument
+        candidates from the last Tab if any, else the commands still matching the
+        /prefix. '' when there's nothing to suggest."""
+        if self._suggest:
+            return self._strip(self._suggest)
+        line = "".join(self.buf)
+        m = self._matches()
+        return self._strip(m) if m and m != [line] else ""
+
+    def _complete_command(self):
+        line = "".join(self.buf)
+        m = self._matches()
+        if len(m) == 1:
+            self.buf[:] = list(m[0] + " ")             # unique -> fill in + space
+        elif m:
+            lcp = os.path.commonprefix(m)              # many -> extend shared prefix
+            if len(lcp) > len(line): self.buf[:] = list(lcp)
+
+    def _complete_arg(self):
+        """Complete a file-name argument via the caller's arg_completer."""
+        if not self._arg_completer:
+            return
+        parts = "".join(self.buf).split(" ")
+        cands = self._arg_completer(parts[0], parts[-1]) or []
+        if len(cands) == 1:
+            c = cands[0]
+            parts[-1] = c if c.endswith("/") else c + " "   # dir -> keep going; file -> next arg
+            self.buf[:] = list(" ".join(parts))
+        elif cands:
+            lcp = os.path.commonprefix(cands)
+            if len(lcp) > len(parts[-1]):
+                parts[-1] = lcp; self.buf[:] = list(" ".join(parts))
+            self._suggest = [c.rstrip("/").rsplit("/", 1)[-1] + ("/" if c.endswith("/") else "")
+                             for c in cands]            # show basenames to pick from
+
+    def _tail(self):
+        """Buffer + dim hint, with the cursor left sitting right after the buffer
+        (the hint's ANSI/reposition are non-printing width-wise)."""
+        line = "".join(self.buf)
+        hint = self._hint()
+        if not hint:
+            return line
+        return line + "\x1b[90m" + hint + "\x1b[0m" + f"\x1b[{len(hint)}D"
+
+    def _refresh(self):
+        """Clear the input line and repaint buffer + hint."""
+        self._write("\r\x1b[K" + self._tail())
 
     def echo_output(self, text):
         """Print async MUD output, keeping the typed line pinned at the bottom."""
         if self.buf:
-            self._write("\r\x1b[K" + text + "".join(self.buf))  # lift input, print, redraw
+            self._write("\r\x1b[K" + text + self._tail())   # lift input, print, redraw
         else:
             self._write(text)
 
     def key(self, kind, ch=""):
         """Apply one logical key event to the line. Returns False to quit."""
-        if kind == "text":                          # printable (incl. Unicode) -> echo
-            self.buf.append(ch); self._write(ch)
+        if kind != "tab":
+            self._suggest = None                    # Tab's candidate strip is transient
+        if kind == "text":                          # printable (incl. Unicode)
+            self.buf.append(ch); self._refresh()
         elif kind == "enter":                       # submit the line
-            self._write("\r\n")
+            self._write("\x1b[K\r\n")               # \x1b[K wipes the dim hint to the right
             line = "".join(self.buf); self.buf.clear()
             if line and (not self.history or self.history[-1] != line):
                 self.history.append(line)           # keep it; skip blanks + dups
             self.hidx = len(self.history); self.pending = ""   # back to a fresh live line
             return self._submit(line)
+        elif kind == "tab":                         # complete command word or argument
+            line = "".join(self.buf)
+            if line.startswith("/") and " " not in line:
+                self._complete_command()
+            elif line.startswith("/") and self._arg_completer:
+                self._complete_arg()
+            self._refresh()
         elif kind == "backspace":
-            if self.buf: self.buf.pop(); self._write("\b \b")
+            if self.buf: self.buf.pop(); self._refresh()
         elif kind == "clear":                       # Ctrl-U -> wipe the line
-            if self.buf: self.buf.clear(); self._write("\r\x1b[K")
+            if self.buf: self.buf.clear(); self._refresh()
         elif kind == "eof":                         # Ctrl-D / Ctrl-Z on empty line
             if not self.buf: return False
         elif kind in ("up", "down") and self.history:   # recall older / newer line
@@ -893,8 +978,17 @@ class LineEditor:
                 self.hidx += 1
             recalled = self.pending if self.hidx == len(self.history) else self.history[self.hidx]
             self.buf[:] = list(recalled)
-            self._write("\r\x1b[K" + recalled)
+            self._refresh()
         return True
+
+# Local /commands, for Tab-completion and the live type-ahead hint. Primary
+# names first (so a bare "/" suggests those), then aliases so they complete too.
+SLASH_COMMANDS = [
+    "/upload", "/download", "/push", "/pull", "/diff", "/lint", "/update",
+    "/goto", "/clone", "/errors", "/autoupdate", "/rm", "/mv",
+    "/lcd", "/rcd", "/lpwd", "/lls", "/where", "/help", "/quit",
+    "/put", "/get", "/log", "/del", "/rename",          # aliases
+]
 
 def cmd_connect(args):
     """Interactive MUD shell: you're connected like telnet (all normal MUD and
@@ -1167,6 +1261,8 @@ def cmd_connect(args):
     HELP = (
         "\r\n"
         "  ── FRsync commands ──   (anything else you type goes straight to the MUD)\r\n"
+        "  type '/' to see commands (they narrow as you type); Tab completes a\r\n"
+        "  command or a file-name argument (local or remote)\r\n"
         "\r\n"
         "   Local folder\r\n"
         "     /lcd <dir>        set your local folder (downloads land here)\r\n"
@@ -1363,7 +1459,30 @@ def cmd_connect(args):
     # (input buffer + Up/Down history) is shared by both raw-mode loops below —
     # POSIX (termios) and Windows (msvcrt); the cooked fallback uses only its
     # echo_output and submits whole lines directly.
-    editor = LineEditor(out, handle_line)
+    # Tab-complete a file-name argument: list the local folder for upload-side
+    # commands, the remote folder (over the MUD) for download-side ones, honouring
+    # a dir prefix in the partial (e.g. "rooms/hu") and offering only dirs to /lcd,
+    # /rcd. Called on demand (Tab), so the per-keystroke hint stays cheap+local.
+    REMOTE_ARG = {"/download", "/get", "/rm", "/del", "/delete", "/mv", "/rename",
+                  "/move", "/update", "/goto", "/clone", "/rcd"}
+    def complete_arg(cmd, partial):
+        dpart, _, base = partial.rpartition("/")
+        dirs_only = cmd in ("/lcd", "/rcd")
+        try:
+            if cmd in REMOTE_ARG:
+                ents = [(n, sz == -2) for n, sz in mud.listdir(resolve_remote(dpart or ".", state["rcwd"]))]
+            else:
+                ld = os.path.join(state["local"], dpart)
+                ents = [(n, os.path.isdir(os.path.join(ld, n))) for n in os.listdir(ld)]
+        except Exception:
+            return []
+        prefix = dpart + "/" if dpart else ""
+        return sorted(prefix + n + ("/" if is_dir else "")
+                      for n, is_dir in ents
+                      if n.startswith(base) and (base[:1] == "." or not n.startswith("."))
+                      and (not dirs_only or is_dir))
+
+    editor = LineEditor(out, handle_line, commands=SLASH_COMMANDS, arg_completer=complete_arg)
 
     def pump_socket(sk):
         """Print pending MUD output and redraw the pinned input. False = closed."""
@@ -1406,6 +1525,8 @@ def cmd_connect(args):
                     if editor.key("eof") is False: return False
                 elif c == "\x15":
                     editor.key("clear")
+                elif c == "\t":                    # Tab: complete the /command
+                    editor.key("tab")
                 elif c == "\x1b":                  # escape seq: Up/Down recall history
                     j += 1; final = ""
                     if j < len(s) and s[j] == "[":
@@ -1485,6 +1606,8 @@ def cmd_connect(args):
                         if editor.key("eof") is False: quit_now = True; break
                     elif ch == "\x15":
                         editor.key("clear")
+                    elif ch == "\t":               # Tab: complete the /command
+                        editor.key("tab")
                     elif ch >= " ":
                         editor.key("text", ch)
                 if quit_now: break

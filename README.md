@@ -79,6 +79,12 @@ for moving files:
 | `/lpwd`, `/lls`      | print / list the local folder |
 | `/help`, `/quit`     | full command list / leave |
 
+Type `/` and the matching commands appear after your cursor, narrowing as you
+type; press **Tab** to complete (a unique match fills in, several extend to the
+common prefix). Tab also completes **file-name arguments** — local files for
+`/upload`, `/diff`, `/lint`; remote files (listed over the MUD) for `/download`,
+`/rm`, `/goto`, `/update`, … — descending into subfolders as you go.
+
 `/upload` and `/download` take **multiple files and glob patterns** —
 space-separated names, or wildcards like `*.c`, `cloud*.c`, `*.*`. Uploads glob
 against your local folder; downloads glob against the remote folder. For example
