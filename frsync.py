@@ -34,7 +34,7 @@ OPTIONS
 Password: read from $FRPASS if set, otherwise prompted (never stored).
 Pure Python 3 standard library — one file, share it freely.
 """
-import argparse, fnmatch, getpass, glob, os, queue, re, select, socket, sys, threading, time, zlib
+import argparse, fnmatch, getpass, glob, os, queue, re, select, shlex, socket, sys, threading, time, zlib
 try:
     import termios, tty          # POSIX-only; absent on Windows
 except ImportError:
@@ -660,6 +660,52 @@ def expand_local_arg(localdir, pattern):
         return [full]
     return sorted(p for p in glob.glob(full) if os.path.isfile(p))
 
+def _strip_file_uri(tok):
+    """A few terminals paste a file:// URI on drop; turn one back into a path."""
+    if tok.startswith("file://"):
+        import urllib.parse
+        return urllib.parse.unquote(urllib.parse.urlsplit(tok).path)
+    return tok
+
+def _ws_split_quoted(s):
+    """Whitespace split that respects '…' / "…" grouping but leaves backslashes
+    untouched — needed for bare Windows paths (C:\\dir\\f) that posix shlex would
+    mangle by treating each backslash as an escape."""
+    out, cur, quote = [], [], None
+    for ch in s:
+        if quote:
+            if ch == quote: quote = None
+            else: cur.append(ch)
+        elif ch in ("'", '"'): quote = ch
+        elif ch.isspace():
+            if cur: out.append("".join(cur)); cur = []
+        else: cur.append(ch)
+    if cur: out.append("".join(cur))
+    return out
+
+def dropped_files(line):
+    """If `line` is one or more existing local file paths — as a terminal inserts
+    when you drag-and-drop files onto it — return that list of paths; else None.
+    Handles backslash-escaped spaces and quotes (macOS/Linux), quoted or bare
+    Windows paths, and file:// URIs. Requires every token to be an existing file
+    AND at least one to look path-like, so ordinary typed lines (`look`, `get
+    sword`, `/upload x`) never trip it."""
+    s = line.strip()
+    if not s:
+        return None
+    candidates = []
+    try: candidates.append(shlex.split(s, posix=True))
+    except ValueError: pass
+    candidates.append(_ws_split_quoted(s))
+    for toks in candidates:
+        if not toks:
+            continue
+        paths = [os.path.expanduser(_strip_file_uri(t)) for t in toks]
+        if all(os.path.isfile(p) for p in paths) and \
+           any(os.path.isabs(p) or os.sep in p or "/" in p for p in paths):
+            return paths
+    return None
+
 def expand_remote_arg(mud, pattern, rcwd):
     """Expand one /download argument against the server. A glob in the final
     path component is matched by listing its directory; a plain name returns
@@ -842,6 +888,34 @@ def cmd_connect(args):
     def batch_transfer(jobs, arrow, dest):
         pinned_batch(jobs, arrow, dest, write=out, ask_key=ask_key, bar=sys.stdout.isatty())
 
+    def upload_local_files(paths):
+        """Push a list of local files to the current remote folder, one batch
+        bar, overwrite prompt per existing file. Shared by /upload and the
+        drag-and-drop handler."""
+        jobs = []
+        for lp in paths:
+            base = os.path.basename(lp); rp = resolve_remote(base, state["rcwd"])
+            sz = len(local_norm(open(lp, "rb").read()))
+            def send(progress, lp=lp, rp=rp):
+                return push_one(mud, lp, rp, made, progress=progress)
+            jobs.append({"base": base, "size": sz,
+                         "exists": mud.file_size(rp) >= 0, "run": send})
+        if not jobs: out("\r\n"); return
+        out("\r\n"); batch_transfer(jobs, "↑", state["rcwd"])
+
+    def offer_upload(paths):
+        """A drag-and-drop landed one or more local file paths on the input line —
+        confirm, then upload them to the current remote folder."""
+        n = len(paths)
+        names = "  ".join(os.path.basename(p) for p in paths)
+        out(f"\r\n  ↑ dropped {n} file(s) → {state['rcwd']}\r\n    {names}\r\n")
+        ans = ask_key("  upload? [Y/n] ") if ask_key else "y"
+        if ans in ("y", "\r", "\n", ""):
+            upload_local_files(paths)
+        else:
+            out("  cancelled.\r\n")
+        return True
+
     HELP = (
         "\r\n"
         "  ── FRsync commands ──   (anything else you type goes straight to the MUD)\r\n"
@@ -857,6 +931,7 @@ def cmd_connect(args):
         "   Transfer files   (names or globs: *.c, cloud*.c, *.* — space-separated)\r\n"
         "     /download f [..]  pull file(s)   remote → local   (alias /get)\r\n"
         "     /upload   f [..]  push file(s)   local → remote   (alias /put)\r\n"
+        "                       …or drag files onto this window to upload them\r\n"
         "\r\n"
         "   Session\r\n"
         "     /where            show current local + remote folders\r\n"
@@ -901,26 +976,25 @@ def cmd_connect(args):
             out("\r\n"); batch_transfer(jobs, "↓", state["local"])
         elif cmd in ("/upload", "/put"):
             if not a: out("\r\n  usage: /upload <file|glob> [..]   (e.g. *.c)\r\n"); return True
-            jobs = []
+            paths = []
             for pat in a:
                 m = expand_local_arg(state["local"], pat)
                 if not m: out(f"\r\n  ✗ {pat}: no local files match\r\n")
                 for lp in m:
                     if not os.path.isfile(lp): out(f"\r\n  ✗ {os.path.basename(lp)}: no such local file\r\n"); continue
-                    base = os.path.basename(lp); rp = resolve_remote(base, state["rcwd"])
-                    sz = len(local_norm(open(lp, "rb").read()))
-                    def send(progress, lp=lp, rp=rp):
-                        return push_one(mud, lp, rp, made, progress=progress)
-                    jobs.append({"base": base, "size": sz,
-                                 "exists": mud.file_size(rp) >= 0, "run": send})
-            if not jobs: out("\r\n"); return True
-            out("\r\n"); batch_transfer(jobs, "↑", state["rcwd"])
+                    paths.append(lp)
+            upload_local_files(paths)
         else:
             out(f"\r\n  unknown /command: {cmd}  (try /help)\r\n")
         return True
 
     def handle_line(line):
         """Process one submitted input line. Returns False to quit the shell."""
+        # drag-and-drop: the terminal pastes the path(s) of dropped files onto the
+        # input line — if the whole line is existing local file(s), offer to upload
+        drop = dropped_files(line)
+        if drop:
+            return offer_upload(drop)
         # keep remote cwd in sync when you cd around the file tree
         if line.strip().startswith("cd ") or line.strip() == "cd":
             arg = line.strip()[2:].strip()
@@ -1128,6 +1202,7 @@ def welcome_banner():
         "  these local commands to move files:\r\n"
         "\r\n"
         "        /upload <file>      send a local file  -> remote folder\r\n"
+        "        (or just drag files onto this window to upload them)\r\n"
         "        /download <file>    fetch a remote file -> this computer\r\n"
         "        /where              show your local + remote folders\r\n"
         "        /lcd <dir>          change the local folder (downloads land here)\r\n"

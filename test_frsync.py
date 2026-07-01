@@ -252,6 +252,28 @@ def test_remote_glob_expansion():
     assert frsync.expand_remote_arg(m, "a.c", "/w/x") == ["/w/x/a.c"]         # literal, no listing needed
 
 
+def test_dropped_files_detection(tmpdir):
+    # the terminal pastes file paths onto the input line on drag-and-drop
+    f1 = os.path.join(tmpdir, "foo.c"); open(f1, "w").close()
+    f2 = os.path.join(tmpdir, "my room.c"); open(f2, "w").close()   # a space in the name
+    # single absolute path, with and without a trailing space the terminal may add
+    assert frsync.dropped_files(f1) == [f1]
+    assert frsync.dropped_files(f1 + "  ") == [f1]
+    # macOS/Linux escape spaces with a backslash; iTerm/Terminal may also quote
+    assert frsync.dropped_files(f2.replace(" ", r"\ ")) == [f2]
+    assert frsync.dropped_files(f'"{f2}"') == [f2]
+    # several files dropped at once
+    assert frsync.dropped_files(f'{f1} "{f2}"') == [f1, f2]
+    # some terminals paste a file:// URI (percent-encoded)
+    assert frsync.dropped_files("file://" + f2.replace(" ", "%20")) == [f2]
+    # ordinary typed lines and /commands must NOT be mistaken for a drop
+    assert frsync.dropped_files("look") is None
+    assert frsync.dropped_files("get sword from bag") is None
+    assert frsync.dropped_files("/upload foo.c") is None
+    assert frsync.dropped_files("/no/such/file.c") is None
+    assert frsync.dropped_files("") is None
+
+
 # --------------------------------------------------------------------- runner
 class _FakeSelf:
     """Stand-in for a Mud instance: _write_once only touches _flush/send/expect."""
@@ -295,6 +317,7 @@ def main():
         ("write command fits line budget",          lambda: test_write_command_fits_line_budget()),
         ("local glob expansion (*.c, cloud*.c)",     lambda: test_local_glob_expansion(tmp)),
         ("remote glob expansion (*.c, *.*)",         lambda: test_remote_glob_expansion()),
+        ("drag-and-drop path detection",             lambda: test_dropped_files_detection(tmp)),
     ]
     failed = 0
     for name, fn in tests:
