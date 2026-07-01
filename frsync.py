@@ -436,19 +436,38 @@ class Mud:
                 restarts += 1; expected = 0; i = 0
                 if progress: progress(expected, total)
 
-    def read_file_bytes(self, path, size, progress=None):
+    def _read_range(self, path, start, end, progress=None):
+        """Read server file bytes [start, end) via read_bytes, hex-framed."""
         buf = bytearray()
-        off = 0
-        if progress: progress(0, size)
-        while off < size:
-            n = min(PULL_CHUNK, size - off)
+        off = start
+        if progress: progress(0, end - start)
+        while off < end:
+            n = min(PULL_CHUNK, end - off)
             code = (f'string c=read_bytes("{path}", {off}, {n}); string r=""; int i; '
                     f'for(i=0;i<strlen(c);i++) r+=sprintf("%02x",c[i]); '
                     f'return "M1"+"M2"+r+"M2"+"M1";')
             buf += self.exec_hex(code)
             off += n
-            if progress: progress(off, size)
+            if progress: progress(off - start, end - start)
         return bytes(buf)
+
+    def read_file_bytes(self, path, size, progress=None):
+        return self._read_range(path, 0, size, progress)
+
+    def read_tail(self, path, nbytes):
+        """Read up to the last `nbytes` bytes of a server file — for tailing logs.
+        Returns b'' if the file is missing/unreadable."""
+        size = self.file_size(path)
+        if size < 0: return b""
+        return self._read_range(path, max(0, size - nbytes), size)
+
+    def update(self, paths, inherit=False):
+        """Recompile (reload) server files in-game via the creator `update`
+        command. `paths` is a list of remote paths. Returns the parsed result
+        from parse_update_output()."""
+        cmd = "update " + ("-o " if inherit else "") + " ".join(paths)
+        self._flush(); self.send(cmd)
+        return parse_update_output(ANSI.sub("", self.drain(1.8)))
 
 # ---------------------------------------------------------------- escaping
 def esc_token(ch):
@@ -878,7 +897,9 @@ def cmd_connect(args):
     # clutter the folder you launched from; override with --dir or /lcd.
     local = os.path.abspath(args.dir or os.path.join(os.getcwd(), "downloads"))
     os.makedirs(local, exist_ok=True)
-    state = {"local": local, "rcwd": home or "/"}
+    state = {"local": local, "rcwd": home or "/",
+             "autoupdate": True,   # reload each .c on the MUD right after pushing it
+             "last_push": []}      # remote paths from the most recent upload (for /update, /goto)
     made = set()
 
     # Overwrite confirmation. Each terminal mode installs its own key reader
@@ -893,13 +914,55 @@ def cmd_connect(args):
         if not ask_key: return True
         return ask_key(prompt) in ("y", "\r", "\n", "")
 
+    def reload_files(rpaths, inherit=False):
+        """Recompile the given remote .c files in-game and report per-file: a
+        clean reload count, plus any compile error as file:line: message."""
+        cfiles = [p for p in rpaths if p.endswith(".c")]
+        hdrs = [p for p in rpaths if p.endswith(".h")]
+        if not cfiles:
+            if hdrs: out("  (changed .h only — reload dependents with /update -o <file>)\r\n")
+            return
+        out(f"  ⟳ update {len(cfiles)} file(s)…\r\n")
+        try:
+            res = mud.update(cfiles, inherit=inherit)
+        except OSError as e:
+            out(f"    ✗ update failed: {str(e)[:60]}\r\n"); return
+        bad = set()
+        for p, line, msg in res["errors"]:
+            bad.add(p); out(f"    ✗ {os.path.basename(p)}:{line}: {msg}\r\n")
+        for p in res["failed"]:
+            bad.add(p); out(f"    ✗ {os.path.basename(p)}: failed to load\r\n")
+        ok = len(cfiles) - len(bad)
+        if ok > 0: out(f"    ✓ reloaded {ok} file(s)\r\n")
+
+    def show_errors(a):
+        """Tail the creator error log (/w/<you>/error-log). `all` keeps the
+        tool's own exec_tmp.c noise; a bare number sets how many lines to show."""
+        n, noise = 20, False
+        for x in a:
+            if x in ("all", "-a"): noise = True
+            elif x.isdigit(): n = int(x)
+        logpath = f"{home}/error-log"
+        raw = mud.read_tail(logpath, 20000).decode("latin-1", "replace")
+        if not raw:
+            out(f"\r\n  no error log at {logpath}\r\n"); return
+        lines = [ln for ln in raw.splitlines() if ln.strip()]
+        if not noise:
+            lines = [ln for ln in lines if "exec_tmp.c" not in ln]
+        lines = lines[-n:]
+        out("\r\n")
+        if not lines:
+            out("  (no recent errors — just tool exec noise; /errors all to see it)\r\n"); return
+        for ln in lines: out("  " + ln + "\r\n")
+
     def upload_local_files(paths):
         """Push a list of local files to the current remote folder, one batch
         bar, overwrite prompt per existing file. Shared by /upload and the
         drag-and-drop handler."""
-        jobs = []
+        jobs = []; rpaths = []
         for lp in paths:
             base = os.path.basename(lp); rp = resolve_remote(base, state["rcwd"])
+            rpaths.append(rp)
             sz = len(local_norm(open(lp, "rb").read()))
             def send(progress, lp=lp, rp=rp):
                 return push_one(mud, lp, rp, made, progress=progress)
@@ -907,6 +970,8 @@ def cmd_connect(args):
                          "exists": mud.file_size(rp) >= 0, "run": send})
         if not jobs: out("\r\n"); return
         out("\r\n"); batch_transfer(jobs, "↑", state["rcwd"])
+        state["last_push"] = rpaths
+        if state["autoupdate"]: reload_files(rpaths)
 
     def offer_upload(paths):
         """A drag-and-drop landed one or more local file paths on the input line —
@@ -937,14 +1002,17 @@ def cmd_connect(args):
                 + (f"   ({same} already match)" if same else "") + "\r\n")
             if not confirm_key(f"  sync {len(todo)} file(s) to the MUD? [Y/n] "):
                 out("  cancelled.\r\n"); return
-            jobs = []
+            jobs = []; rpaths = []
             for rel in todo:
                 lp = os.path.join(lroot, rel); rp = f"{rroot}/{rel.replace(os.sep, '/')}"
+                rpaths.append(rp)
                 sz = len(local_norm(open(lp, "rb").read()))
                 def send(progress, lp=lp, rp=rp):
                     return push_one(mud, lp, rp, made, progress=progress)
                 jobs.append({"base": rel, "size": sz, "exists": False, "run": send})
             out("\r\n"); batch_transfer(jobs, "↑", rroot)
+            state["last_push"] = rpaths
+            if state["autoupdate"]: reload_files(rpaths)
         else:
             out(f"\r\n  scanning {rroot} …\r\n")
             rels = mud.walk(rroot)
@@ -993,6 +1061,13 @@ def cmd_connect(args):
         "   Sync a whole folder tree   (recursive: every file + subfolder)\r\n"
         "     /push             upload everything    local → remote\r\n"
         "     /pull             download everything  remote → local\r\n"
+        "\r\n"
+        "   Build & test   (pushed .c files auto-reload; see /autoupdate)\r\n"
+        "     /update [-o] f    recompile file(s) in-game; shows compile errors\r\n"
+        "     /goto <file>      teleport into a room by its file\r\n"
+        "     /clone <file>     clone an object to test it\r\n"
+        "     /errors [n|all]   show the last n lines of your MUD error log\r\n"
+        "     /autoupdate on|off  toggle auto-reload after each push\r\n"
         "\r\n"
         "   Session\r\n"
         "     /where            show current local + remote folders\r\n"
@@ -1047,6 +1122,33 @@ def cmd_connect(args):
             upload_local_files(paths)
         elif cmd == "/push": do_sync("up")
         elif cmd == "/pull": do_sync("down")
+        elif cmd == "/update":
+            inherit = bool(a) and a[0] in ("-o", "--inherit")
+            names = a[1:] if inherit else a
+            if names:
+                rpaths = [resolve_remote(x, state["rcwd"]) for x in names]
+            elif state["last_push"]:
+                rpaths = state["last_push"]
+            else:
+                out("\r\n  usage: /update [-o] <file> [..]   (or push something first)\r\n"); return True
+            out("\r\n"); reload_files(rpaths, inherit=inherit)
+        elif cmd == "/goto":
+            if not a: out("\r\n  usage: /goto <file|room>\r\n"); return True
+            tgt = resolve_remote(a[0], state["rcwd"])
+            if tgt.endswith(".c"): tgt = tgt[:-2]
+            mud._flush(); mud.send(f"goto {tgt}")
+            out("\r\n" + mud.drain(1.5))
+        elif cmd == "/clone":
+            if not a: out("\r\n  usage: /clone <file> [..]\r\n"); return True
+            rpaths = [resolve_remote(x, state["rcwd"]) for x in a]
+            mud._flush(); mud.send("clone " + " ".join(rpaths))
+            out("\r\n" + mud.drain(1.5))
+        elif cmd in ("/errors", "/log"):
+            show_errors(a)
+        elif cmd == "/autoupdate":
+            state["autoupdate"] = (a[0] == "on") if a and a[0] in ("on", "off") \
+                                  else not state["autoupdate"]
+            out(f"\r\n  auto-update after push: {'on' if state['autoupdate'] else 'off'}\r\n")
         else:
             out(f"\r\n  unknown /command: {cmd}  (try /help)\r\n")
         return True
@@ -1269,6 +1371,8 @@ def welcome_banner():
         "        /download <file>    fetch a remote file -> this computer\r\n"
         "        /push               upload the whole folder tree (recursive)\r\n"
         "        /pull               download the whole folder tree (recursive)\r\n"
+        "        (pushed .c files auto-reload in-game; /errors shows compile errors)\r\n"
+        "        /goto <file>        teleport into a room  ·  /clone <file>  test an object\r\n"
         "        /where              show your local + remote folders\r\n"
         "        /lcd <dir>          change the local folder (downloads land here)\r\n"
         "        /rcd <dir>          change the remote folder (transfers use this)\r\n"
@@ -1507,6 +1611,26 @@ def verify_remote(mud, path, data):
     norm = local_norm(data)
     return mud.file_size(path) == len(norm) and \
            mud.crc32_remote(path) == jamcrc(norm)
+
+# The creator `update` command prints one of these per file it (re)compiles:
+#   Loaded /w/x/room.c                         -> freshly loaded ok
+#   Updated x's workroom(/w/x/workroom).       -> reloaded an already-live object
+#   E /w/x/room.c at line 8 : syntax error ... -> a compile error on that line
+#   Failed to load /w/x/room.c, error: ...     -> the object did not load
+_UPD_ERR  = re.compile(r"^E (\S+) at line (\d+)\s*:\s*(.+?)\s*$", re.M)
+_UPD_FAIL = re.compile(r"^Failed to load (\S+?),?\s", re.M)
+_UPD_LOAD = re.compile(r"^Loaded (\S+)", re.M)
+_UPD_UPD  = re.compile(r"^Updated .*?\((/\S+?)\)", re.M)
+
+def parse_update_output(text):
+    """Classify `update` output. Returns
+    {'errors': [(path, line, msg)], 'failed': [path], 'loaded': [path]}.
+    `failed` excludes paths already listed in `errors` (same file)."""
+    errors = [(p, int(n), m) for p, n, m in _UPD_ERR.findall(text)]
+    err_paths = {p for p, _, _ in errors}
+    failed = [p for p in _UPD_FAIL.findall(text) if p not in err_paths]
+    loaded = _UPD_LOAD.findall(text) + _UPD_UPD.findall(text)
+    return {"errors": errors, "failed": failed, "loaded": loaded}
 
 def show_plan(states, mode):
     order = ["new", "diff", "remote_only", "same"]
