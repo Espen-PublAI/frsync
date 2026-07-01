@@ -410,7 +410,7 @@ def test_lineeditor_autocomplete():
     ed.buf = list("kill orc"); ed.key("tab"); assert "".join(ed.buf) == "kill orc"
 
     # --- argument completion (Tab on a file-name arg via arg_completer) ---
-    def completer(cmd, partial):
+    def completer(cmd, partial, live=False):     # completer takes a live flag
         pool = {"/upload": ["area.c", "rooms/", "obj/"],
                 "/download": ["clearing.c", "clone_helper.c", "hut.c"]}.get(cmd, [])
         d, _, base = partial.rpartition("/")
@@ -427,6 +427,24 @@ def test_lineeditor_autocomplete():
     assert ed2._suggest == ["clearing.c", "clone_helper.c"]
     # the candidate strip is transient — cleared by the next keystroke
     ed2.key("text", "e"); assert ed2._suggest is None
+
+    # --- live local-file narrowing in the hint (cheap), remote stays Tab-only ---
+    def live_completer(cmd, partial, live=False):
+        if live and cmd in ("/download", "/goto"):     # remote: too costly per keystroke
+            return None
+        pool = {"/upload": ["area.c", "rooms/", "obj/"],
+                "/download": ["clearing.c", "hut.c"]}.get(cmd, [])
+        d, _, base = partial.rpartition("/")
+        return sorted(p for p in pool if p.startswith(base))
+    ed3 = frsync.LineEditor(lambda s: None, lambda l: True,
+                            commands=["/upload", "/download", "/goto"], arg_completer=live_completer)
+    ed3.buf = list("/upload ");  assert ed3._hint() == "  area.c  obj/  rooms/"   # all, live
+    ed3.buf = list("/upload r"); assert ed3._hint() == "  rooms/"                 # narrows live
+    ed3.buf = list("/upload area.c"); assert ed3._hint() == ""                    # exact single -> quiet
+    ed3.buf = list("/download c"); assert ed3._hint() == ""                       # remote -> silent live
+    ed3.buf = list("/goto x/y");   assert ed3._hint() == ""                       # remote -> silent live
+    # but Tab on a remote arg still lists (live defaults False)
+    ed3.buf = list("/download c"); ed3.key("tab"); assert "".join(ed3.buf) == "/download clearing.c "
 
 
 def test_unified_diff_lines():

@@ -888,15 +888,32 @@ class LineEditor:
             shown.append(c)
         return "  " + "  ".join(shown) + ("  …" if len(shown) < len(items) else "")
 
+    @staticmethod
+    def _disp(cand):
+        """Display form of a completion candidate: its last path segment, keeping
+        a trailing / for directories (so the strip stays short for subpaths)."""
+        return cand.rstrip("/").rsplit("/", 1)[-1] + ("/" if cand.endswith("/") else "")
+
     def _hint(self):
         """The dim suggestion strip shown after the cursor: transient argument
-        candidates from the last Tab if any, else the commands still matching the
-        /prefix. '' when there's nothing to suggest."""
+        candidates from the last Tab if any; else the commands still matching the
+        /prefix; else — while you're typing an argument to a command whose files
+        are cheap to list (local) — the matching file names, narrowing live.
+        '' when there's nothing to suggest."""
         if self._suggest:
             return self._strip(self._suggest)
         line = "".join(self.buf)
-        m = self._matches()
-        return self._strip(m) if m and m != [line] else ""
+        if not line.startswith("/"):
+            return ""
+        if " " not in line:                              # completing the command word
+            m = self._matches()
+            return self._strip(m) if m and m != [line] else ""
+        if self._arg_completer:                          # completing an argument
+            parts = line.split(" ")
+            cands = self._arg_completer(parts[0], parts[-1], True)   # live=True: local only
+            if cands and not (len(cands) == 1 and cands[0].rstrip("/") == parts[-1].rstrip("/")):
+                return self._strip([self._disp(c) for c in cands])
+        return ""
 
     def _complete_command(self):
         line = "".join(self.buf)
@@ -921,8 +938,7 @@ class LineEditor:
             lcp = os.path.commonprefix(cands)
             if len(lcp) > len(parts[-1]):
                 parts[-1] = lcp; self.buf[:] = list(" ".join(parts))
-            self._suggest = [c.rstrip("/").rsplit("/", 1)[-1] + ("/" if c.endswith("/") else "")
-                             for c in cands]            # show basenames to pick from
+            self._suggest = [self._disp(c) for c in cands]   # show basenames to pick from
 
     def _tail(self):
         """Buffer + dim hint, with the cursor left sitting right after the buffer
@@ -1261,8 +1277,8 @@ def cmd_connect(args):
     HELP = (
         "\r\n"
         "  ── FRsync commands ──   (anything else you type goes straight to the MUD)\r\n"
-        "  type '/' to see commands (they narrow as you type); Tab completes a\r\n"
-        "  command or a file-name argument (local or remote)\r\n"
+        "  type '/' to see commands (they narrow as you type); local file args\r\n"
+        "  narrow live too, and Tab completes a command, local file, or remote file\r\n"
         "\r\n"
         "   Local folder\r\n"
         "     /lcd <dir>        set your local folder (downloads land here)\r\n"
@@ -1459,17 +1475,22 @@ def cmd_connect(args):
     # (input buffer + Up/Down history) is shared by both raw-mode loops below —
     # POSIX (termios) and Windows (msvcrt); the cooked fallback uses only its
     # echo_output and submits whole lines directly.
-    # Tab-complete a file-name argument: list the local folder for upload-side
+    # Complete a file-name argument: list the local folder for upload-side
     # commands, the remote folder (over the MUD) for download-side ones, honouring
     # a dir prefix in the partial (e.g. "rooms/hu") and offering only dirs to /lcd,
-    # /rcd. Called on demand (Tab), so the per-keystroke hint stays cheap+local.
+    # /rcd. `live` is set for the per-keystroke hint: local listing is cheap so we
+    # do it, but remote listing would hit the MUD every keystroke, so we decline
+    # (return None) and leave remote-arg completion to on-demand Tab.
     REMOTE_ARG = {"/download", "/get", "/rm", "/del", "/delete", "/mv", "/rename",
                   "/move", "/update", "/goto", "/clone", "/rcd"}
-    def complete_arg(cmd, partial):
+    def complete_arg(cmd, partial, live=False):
+        remote = cmd in REMOTE_ARG
+        if live and remote:
+            return None
         dpart, _, base = partial.rpartition("/")
         dirs_only = cmd in ("/lcd", "/rcd")
         try:
-            if cmd in REMOTE_ARG:
+            if remote:
                 ents = [(n, sz == -2) for n, sz in mud.listdir(resolve_remote(dpart or ".", state["rcwd"]))]
             else:
                 ld = os.path.join(state["local"], dpart)
