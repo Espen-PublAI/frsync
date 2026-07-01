@@ -60,8 +60,15 @@ for moving files:
 
 | Command | Does |
 |---|---|
-| `/upload <f> [..]`   | send local file(s) → the remote folder |
+| `/upload <f> [..]`   | send local file(s) → the remote folder (or just **drag files onto the window**) |
 | `/download <f> [..]` | fetch remote file(s) → this computer |
+| `/push`              | mirror the **whole** local folder tree → remote (recursive) |
+| `/pull`              | mirror the **whole** remote folder tree → local (recursive) |
+| `/update [-o] <f>`   | recompile file(s) in-game; prints compile errors as `file:line: msg` |
+| `/goto <file>`       | teleport into a room by its file |
+| `/clone <file>`      | clone an object to test it |
+| `/errors [n\|all]`   | tail your MUD error log (runtime + compile errors) |
+| `/autoupdate on\|off`| toggle auto-reload after each push (**on** by default) |
 | `/where`             | show your current local + remote folders |
 | `/lcd <dir>`         | change the **local** folder (downloads land here) |
 | `/rcd <dir>`         | change the **remote** folder (transfers use this) |
@@ -72,6 +79,22 @@ for moving files:
 space-separated names, or wildcards like `*.c`, `cloud*.c`, `*.*`. Uploads glob
 against your local folder; downloads glob against the remote folder. For example
 `/upload *.c` or `/download room*.c a.c b.c`.
+
+**The builder loop.** Whenever you upload a `.c` (via `/upload`, `/push`, or
+drag-and-drop), FRsync automatically `update`s it on the MUD and shows the
+result — a clean reload count, or the compile error mapped to `file:line`:
+
+```
+  ↑ 1 file(s), 1.2K -> /w/you/drifting_forest/rooms
+  ⟳ update 1 file(s)…
+    ✗ hut.c:14: Undefined variable 'exts' before  ; }
+```
+
+So edit → save → drop → see the compile result, without touching the MUD
+window. Then `/goto rooms/hut` to stand in the room, `/clone obj/torch` to test
+an object, and `/errors` to read runtime errors. Turn the auto-reload off with
+`/autoupdate off` (then reload by hand with `/update`, `-o` to update an inherit
+chain when you changed a base or `.h`).
 
 A multi-file transfer runs through the files one at a time, advancing a
 **single overall progress bar** (total bytes across the whole batch, and which
@@ -180,9 +203,11 @@ also just copy or paste it anywhere and run it.
 ## Part 2 — The MCP server for Claude Code
 
 This exposes the MUD to an AI agent as tools: `mud_ls`, `mud_read`,
-`mud_write`, `mud_download`, `mud_upload`, `mud_command`, `mud_exec`,
-`mud_whoami`. (There is deliberately **no delete tool** — the server never
-removes server files.)
+`mud_write`, `mud_update`, `mud_errors`, `mud_download`, `mud_upload`,
+`mud_command`, `mud_exec`, `mud_whoami`. So an agent can read a room, fix a bug,
+write it back, **`mud_update` to reload it and catch compile errors**, then
+**`mud_errors` to read runtime errors** — the full build/test loop. (There is
+deliberately **no delete tool** — the server never removes server files.)
 
 ### 1. Install the dependencies
 

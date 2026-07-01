@@ -36,6 +36,8 @@ TOOLS
   mud_ls(path)                list a server directory
   mud_read(path[, max_bytes]) read a server file as text
   mud_write(path, content)    write a server file (verified); never deletes
+  mud_update(path[, inherit]) reload a .c in-game; reports compile errors
+  mud_errors([lines])         tail your creator error log (runtime/compile)
   mud_download(remote, local) save a server file to local disk
   mud_upload(local, remote)   upload a local file to the server (verified)
   mud_whoami()                show connection / who we're logged in as
@@ -306,9 +308,48 @@ def mud_write(path: str, content: str) -> str:
         # quotes) is preserved exactly rather than silently replaced with '?'.
         # The transport layer treats the bytes opaquely, so they round-trip.
         data = content.encode("utf-8")
+        frsync.ensure_remote_dirs(m, path, set())   # create parent dirs (as mud_upload does)
         m.write_file_chunks(path, data)
         ok = frsync.verify_remote(m, path, data)
     return f"{'OK' if ok else 'FAILED VERIFY'}: wrote {len(data)} bytes to {path}"
+
+@mcp.tool()
+@_heals
+def mud_update(path: str, inherit: bool = False) -> str:
+    """Recompile (reload) a server .c file in-game so the live MUD uses the
+    latest version, and report any compile errors as 'file line N: message'.
+    Run this after mud_write/mud_upload to make a code change take effect and to
+    confirm it compiled. inherit=True adds the -o flag (update the whole inherit
+    chain — needed when you changed a base/.h that other objects inherit)."""
+    with _lock:
+        res = _get().update([path], inherit=inherit)
+    if res["errors"]:
+        return "COMPILE ERROR:\n" + "\n".join(
+            f"  {p} line {ln}: {m}" for p, ln, m in res["errors"])
+    if res["failed"]:
+        return "FAILED TO LOAD: " + ", ".join(res["failed"])
+    if res["loaded"]:
+        return "OK reloaded: " + ", ".join(res["loaded"])
+    return "(update sent, no confirmation seen — check mud_errors)"
+
+@mcp.tool()
+@_heals
+def mud_errors(lines: int = 20, include_tool_noise: bool = False) -> str:
+    """Tail your creator error log (/w/<you>/error-log) — the runtime and compile
+    errors the driver dumped, newest last. Use this to debug a room/object that
+    loads but misbehaves. By default hides frsync's own exec_tmp.c compile noise;
+    set include_tool_noise=True to see everything."""
+    with _lock:
+        m = _get()
+        logpath = f"/w/{(m.char or '').lower()}/error-log"
+        raw = m.read_tail(logpath, 20000).decode("latin-1", "replace")
+    if not raw:
+        return f"(no error log at {logpath})"
+    ls = [ln for ln in raw.splitlines() if ln.strip()]
+    if not include_tool_noise:
+        ls = [ln for ln in ls if "exec_tmp.c" not in ln]
+    ls = ls[-lines:]
+    return "\n".join(ls) if ls else "(no recent errors — only tool exec noise)"
 
 @mcp.tool()
 @_heals

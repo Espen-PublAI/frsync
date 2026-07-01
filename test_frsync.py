@@ -305,6 +305,30 @@ def test_recursive_plan_with_subfolders(tmpdir):
     assert todo == ["area.c", "rooms/hut.c"]
 
 
+def test_parse_update_output():
+    # exact strings the live FR:Legacy `update` command emits (captured 2026-07)
+    fail = ("E /w/malric/room.c at line 2 : Undefined variable 'x' before  ; }\n"
+            "E /w/malric/room.c at line 2 : syntax error before  }\n"
+            "Failed to load /w/malric/room.c, error: *Error in loading object\n")
+    r = frsync.parse_update_output(fail)
+    assert r["errors"] == [("/w/malric/room.c", 2, "Undefined variable 'x' before  ; }"),
+                           ("/w/malric/room.c", 2, "syntax error before  }")]
+    assert r["failed"] == []          # same file already reported via errors -> not double-counted
+
+    ok = "Loaded /w/malric/workroom.c"
+    assert frsync.parse_update_output(ok) == {"errors": [], "failed": [],
+                                              "loaded": ["/w/malric/workroom.c"]}
+
+    multi = ("[Deprecated #7414 saved]\nLoaded /w/malric/b.c\n"
+             "Updated malric's workroom(/w/malric/workroom).")
+    r = frsync.parse_update_output(multi)
+    assert r["errors"] == [] and r["loaded"] == ["/w/malric/b.c", "/w/malric/workroom"]
+
+    # a pure load failure with no per-line compile error still shows up
+    r = frsync.parse_update_output("Failed to load /w/malric/c.c, error: no such file\n")
+    assert r["failed"] == ["/w/malric/c.c"]
+
+
 # --------------------------------------------------------------------- runner
 class _FakeSelf:
     """Stand-in for a Mud instance: _write_once only touches _flush/send/expect."""
@@ -350,6 +374,7 @@ def main():
         ("remote glob expansion (*.c, *.*)",         lambda: test_remote_glob_expansion()),
         ("drag-and-drop path detection",             lambda: test_dropped_files_detection(tmp)),
         ("recursive plan across subfolders",         lambda: test_recursive_plan_with_subfolders(tmp)),
+        ("parse update/reload output",               lambda: test_parse_update_output()),
     ]
     failed = 0
     for name, fn in tests:
