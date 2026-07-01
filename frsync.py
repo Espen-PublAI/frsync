@@ -1041,8 +1041,12 @@ def cmd_connect(args):
                 srcs[rel] = _strip_c_comments(raw)     # strip once; used for defines AND refs
             except OSError: pass
         defines = collect_defines(srcs.values())       # comment-free, so trailing // can't break a macro
+        wrappers = find_ref_wrappers(srcs.values())     # learn custom add_exit/clone helpers
         cfiles = sorted(r for r in srcs if r.endswith(".c"))
         out(f"\r\n  linting {len(cfiles)} file(s) under {root} (targets checked on the MUD) …\r\n")
+        if wrappers:
+            out("  recognised wrapper(s): "
+                + ", ".join(f"{n}()→{k}" for n, (k, _) in sorted(wrappers.items())) + "\r\n")
         cache, rc = {}, state["rcwd"].rstrip("/")
         def on_mud(p):
             if p not in cache: cache[p] = mud.file_size(p) >= 0
@@ -1050,7 +1054,7 @@ def cmd_connect(args):
         broken = checked = 0
         skipped = []                                    # (rel, line, kind, expr) we couldn't resolve
         for rel in cfiles:
-            for ref in extract_references(srcs[rel], defines):
+            for ref in extract_references(srcs[rel], defines, wrappers):
                 if ref["path"] is None:
                     skipped.append((rel, ref["line"], ref["kind"], ref["expr"])); continue
                 checked += 1
@@ -1952,15 +1956,67 @@ def _find_calls(text, funcname):
             j += 1
         yield _split_top(text[m.end():j - 1], ","), m.start()
 
-# (function, argument index) for each call whose arg names a file.
-_REF_CALLS = [("add_exit", 1), ("clone_object", 0), ("add_clone", 0),
-              ("load_object", 0), ("find_object", 0)]
+# (function, argument index, reported kind) for each call whose arg names a file.
+_REF_CALLS = [("add_exit", 1, "exit"), ("clone_object", 0, "clone_object"),
+              ("add_clone", 0, "add_clone"), ("load_object", 0, "load_object"),
+              ("find_object", 0, "find_object")]
 
-def extract_references(text, defines):
+_FUNC_RX = re.compile(r"\b([A-Za-z_]\w*)\s*\(([^;{)]*)\)\s*\{")
+_NOT_FUNCS = {"if", "while", "for", "foreach", "switch", "catch", "do", "return"}
+
+def _param_names(paramstr):
+    """Names of a function's parameters (last identifier of each `type name`)."""
+    names = []
+    for p in _split_top(paramstr, ","):
+        ids = re.findall(r"[A-Za-z_]\w*", p)
+        if ids: names.append(ids[-1])
+    return names
+
+def _brace_body(text, open_idx):
+    """Substring between the '{' at text[open_idx] and its matching '}'."""
+    depth, j, instr, esc = 0, open_idx, False, False
+    while j < len(text):
+        c = text[j]
+        if instr:
+            if esc: esc = False
+            elif c == "\\": esc = True
+            elif c == '"': instr = False
+        elif c == '"': instr = True
+        elif c == "{": depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0: return text[open_idx + 1:j]
+        j += 1
+    return text[open_idx + 1:]
+
+def find_ref_wrappers(texts):
+    """Discover project helper functions that forward one of their parameters
+    straight into a known reference call — e.g. add_dream_exit(dir,dest,type)
+    that calls add_exit(dir,dest,type). Returns {wrapper_name: (kind, arg_index)}
+    so calls to the wrapper get linted like the call they wrap. Without this an
+    area that wires its exits through a custom helper would go largely unchecked."""
+    wrappers = {}
+    for text in texts:
+        for m in _FUNC_RX.finditer(text):
+            name, params = m.group(1), m.group(2)
+            if name in _NOT_FUNCS or name in {c[0] for c in _REF_CALLS}:
+                continue
+            pnames = _param_names(params)
+            if not pnames:
+                continue
+            body = _brace_body(text, m.end() - 1)
+            for fn, idx, kind in _REF_CALLS:
+                for args, _off in _find_calls(body, fn):
+                    if len(args) > idx and args[idx].strip() in pnames:
+                        wrappers[name] = (kind, pnames.index(args[idx].strip()))
+    return wrappers
+
+def extract_references(text, defines, wrappers=None):
     """Find file references in one (comment-stripped) LPC source. Returns a list
     of {kind, expr, path, line}: `path` is the resolved target normalised to a
     real '<base>.c' file (FR omits .c on some inherits/loads), or None when the
-    expression can't be resolved statically (a variable — skipped by the linter)."""
+    expression can't be resolved statically (a variable — skipped by the linter).
+    `wrappers` (from find_ref_wrappers) adds project exit/clone/load helpers."""
     refs = []
     def add(kind, expr, off):
         resolved = eval_str_expr(expr, defines)
@@ -1972,10 +2028,12 @@ def extract_references(text, defines):
                      "path": path, "line": text.count("\n", 0, off) + 1})
     for m in re.finditer(r"\binherit\s+([^;{]+);", text):
         add("inherit", m.group(1), m.start())
-    for fn, idx in _REF_CALLS:
+    calls = [(fn, idx, kind) for fn, idx, kind in _REF_CALLS]
+    calls += [(fn, idx, kind) for fn, (kind, idx) in (wrappers or {}).items()]
+    for fn, idx, kind in calls:
         for args, off in _find_calls(text, fn):
             if len(args) > idx and args[idx].strip():
-                add("exit" if fn == "add_exit" else fn, args[idx], off)
+                add(kind, args[idx], off)
     for m in re.finditer(r'#\s*include\s+"([^"]+)"', text):
         p = m.group(1)
         refs.append({"kind": "include", "expr": p,

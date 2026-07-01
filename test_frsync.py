@@ -348,6 +348,30 @@ def test_area_lint_parsing():
     assert not any("ghost.c" in (r["path"] or "") for r in refs)
 
 
+def test_lint_custom_exit_wrapper():
+    # Drifting Forest wires its dream rooms through a custom add_dream_exit()
+    # helper (113 calls vs 5 raw add_exit) — lint must learn the wrapper or it
+    # checks almost none of the real exit graph.
+    defs = frsync.collect_defines(['#define DF_ROOMS "/w/malric/df/rooms/"\n'
+                                   '#define DF_DREAM05 (DF_ROOMS + "dream05.c")\n'])
+    base = ("void add_dream_exit(string dir, string dest, string type) {\n"
+            "  base_exits[dir] = ({dest, type});\n"
+            "  add_exit(dir, dest, type);\n"
+            "}\n")
+    room = 'void setup() { add_dream_exit("north", DF_DREAM05, "path"); }\n'
+    wrappers = frsync.find_ref_wrappers([base, room])
+    # detected: add_dream_exit forwards its 2nd param (index 1) to add_exit's dest
+    assert wrappers.get("add_dream_exit") == ("exit", 1)
+    # and 'if (...) {' etc. must NOT be mistaken for a wrapper
+    assert "if" not in wrappers and "for" not in wrappers
+    # now the wrapped call resolves like a real exit
+    refs = frsync.extract_references(room, defs, wrappers)
+    hit = [r for r in refs if r["kind"] == "exit"]
+    assert hit and hit[0]["path"] == "/w/malric/df/rooms/dream05.c"
+    # without the wrapper it would be invisible (not even counted)
+    assert not frsync.extract_references(room, defs)
+
+
 def test_unified_diff_lines():
     # MUD copy is the 'before', local is the 'after': + is what a push would
     # apply, - is MUD-only content (e.g. a live `ed` edit that drifted).
@@ -462,6 +486,7 @@ def main():
         ("delete/rename return codes",               lambda: test_delete_rename_return_codes()),
         ("unified diff local vs MUD",                lambda: test_unified_diff_lines()),
         ("area lint: macros + references",           lambda: test_area_lint_parsing()),
+        ("area lint: custom exit wrapper",           lambda: test_lint_custom_exit_wrapper()),
     ]
     failed = 0
     for name, fn in tests:
