@@ -1002,7 +1002,7 @@ class LineEditor:
 SLASH_COMMANDS = [
     "/upload", "/download", "/push", "/pull", "/diff", "/lint", "/update",
     "/goto", "/clone", "/errors", "/autoupdate", "/rm", "/mv",
-    "/lcd", "/rcd", "/lpwd", "/lls", "/where", "/help", "/quit",
+    "/lcd", "/rcd", "/lpwd", "/lls", "/idle", "/where", "/help", "/quit",
     "/put", "/get", "/log", "/del", "/rename",          # aliases
 ]
 
@@ -1023,6 +1023,12 @@ def cmd_connect(args):
              "autoupdate": True,   # reload each .c on the MUD right after pushing it
              "last_push": []}      # remote paths from the most recent upload (for /update, /goto)
     made = set()
+
+    # Idle keepalive: send a telnet NOP every `secs` so a quiet connection isn't
+    # dropped by a NAT/firewall/server idle timeout (which surfaces as an
+    # ETIMEDOUT on the next read). A NOP is consumed silently by the MUD — tested
+    # to produce no output — so it never clutters the shell. On by default.
+    idle = {"on": True, "secs": 60, "next": time.monotonic() + 60}
 
     # Overwrite confirmation. Each terminal mode installs its own key reader
     # below (single keypress in raw mode, a line read in the fallback) that
@@ -1313,6 +1319,7 @@ def cmd_connect(args):
         "     /autoupdate on|off  toggle auto-reload after each push\r\n"
         "\r\n"
         "   Session\r\n"
+        "     /idle [on|off|N]  keepalive so an idle link isn't dropped (on, 60s)\r\n"
         "     /where            show current local + remote folders\r\n"
         "     /help             show this help\r\n"
         "     /quit             leave FRsync\r\n"
@@ -1408,6 +1415,16 @@ def cmd_connect(args):
             state["autoupdate"] = (a[0] == "on") if a and a[0] in ("on", "off") \
                                   else not state["autoupdate"]
             out(f"\r\n  auto-update after push: {'on' if state['autoupdate'] else 'off'}\r\n")
+        elif cmd == "/idle":
+            if a and a[0] in ("on", "off"):
+                idle["on"] = a[0] == "on"
+            elif a and a[0].isdigit():
+                idle["secs"] = max(15, int(a[0])); idle["on"] = True
+            elif a:
+                out("\r\n  usage: /idle [on|off|<seconds>]\r\n"); return True
+            idle["next"] = time.monotonic() + idle["secs"]
+            out(f"\r\n  idle keepalive: {'on' if idle['on'] else 'off'}"
+                f" (every {idle['secs']}s)\r\n")
         elif cmd in ("/rm", "/del", "/delete"):
             if not a: out("\r\n  usage: /rm <file|glob> [..]   (deletes on the MUD)\r\n"); return True
             targets = []
@@ -1506,13 +1523,29 @@ def cmd_connect(args):
     editor = LineEditor(out, handle_line, commands=SLASH_COMMANDS, arg_completer=complete_arg)
 
     def pump_socket(sk):
-        """Print pending MUD output and redraw the pinned input. False = closed."""
-        data = sk.recv(65536)
+        """Print pending MUD output and redraw the pinned input. False = the link
+        is gone (closed, dropped, or timed out) — so the caller exits cleanly."""
+        try:
+            data = sk.recv(65536)
+        except OSError:                 # e.g. ETIMEDOUT after an idle drop; select()
+            out("\r\n*** MUD connection lost. ***\r\n"); return False   # can flag a dead fd readable
         if not data:
             out("\r\n*** MUD closed the connection. ***\r\n"); return False
         text = mud._strip_iac(data)
         if text:
             editor.echo_output(text)
+        return True
+
+    def maybe_ping():
+        """When the keepalive is on and the interval has elapsed, send a telnet
+        NOP to keep the link warm. Returns False if the link is gone."""
+        if not idle["on"] or time.monotonic() < idle["next"]:
+            return True
+        idle["next"] = time.monotonic() + idle["secs"]
+        try:
+            mud.s.sendall(bytes([255, 241]))       # IAC NOP — silently consumed
+        except OSError:
+            out("\r\n*** MUD connection lost. ***\r\n"); return False
         return True
 
     _termios, _tty = termios, tty   # locals so the None-guards below narrow cleanly
@@ -1568,6 +1601,7 @@ def cmd_connect(args):
                 except (ValueError, OSError):
                     out("\r\n*** MUD connection lost. ***\r\n"); break
                 if sk in r and not pump_socket(sk): break
+                if not maybe_ping(): break
                 if sys.stdin in r:
                     chunk = os.read(fd, 4096)
                     if not chunk: break                # EOF
@@ -1610,6 +1644,7 @@ def cmd_connect(args):
                 except (ValueError, OSError):
                     out("\r\n*** MUD connection lost. ***\r\n"); break
                 if r and not pump_socket(sk): break
+                if not maybe_ping(): break
                 quit_now = False
                 while msvcrt.kbhit():               # type: ignore[union-attr]  drain keyboard, no block
                     ch = msvcrt.getwch()            # type: ignore[union-attr]
@@ -1664,6 +1699,7 @@ def cmd_connect(args):
             except (ValueError, OSError):
                 out("\r\n*** MUD connection lost. ***\r\n"); break
             if r and not pump_socket(sk): break
+            if not maybe_ping(): break
             done = False
             while True:                    # drain whatever the reader has queued
                 try: line = line_q.get_nowait()
