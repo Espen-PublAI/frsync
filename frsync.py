@@ -31,10 +31,12 @@ OPTIONS
   --dry-run          show what push/pull WOULD do, change nothing
   -y / --yes         don't ask for confirmation before writing
 
-Password: read from $FRPASS if set, otherwise prompted (never stored).
+Password: from $FRPASS, a saved login (stored in the OS keychain — never in a
+file), or prompted. After a login you're offered to save it; next time you pick
+it with the arrow keys. Manage saved logins with `frsync logins`.
 Pure Python 3 standard library — one file, share it freely.
 """
-import argparse, difflib, fnmatch, getpass, glob, os, queue, re, select, shlex, socket, sys, threading, time, zlib
+import argparse, difflib, fnmatch, getpass, glob, json, os, queue, re, select, shlex, socket, subprocess, sys, threading, time, zlib
 try:
     import termios, tty          # POSIX-only; absent on Windows
 except ImportError:
@@ -577,14 +579,222 @@ def plan(mud, local_root, remote_root, exts, is_file):
     return states
 
 # ---------------------------------------------------------------- commands
+# ---------------------------------------------------------------- saved logins
+# Passwords go in the OS keychain, NEVER a plaintext file. A tiny JSON index in
+# ~/.frsync/logins.json holds only the saved creator names + the "don't ask"
+# flag, so we can show a picker without touching secrets. Backend: `keyring` if
+# it's installed, else the built-in macOS `security` CLI (zero extra deps).
+FRSYNC_DIR   = os.path.join(os.path.expanduser("~"), ".frsync")
+LOGINS_INDEX = os.path.join(FRSYNC_DIR, "logins.json")
+KC_SERVICE   = "frsync-login"
+
+def _keyring_mod():
+    try:
+        import keyring
+        from keyring.backends.fail import Keyring as _Fail
+        return None if isinstance(keyring.get_keyring(), _Fail) else keyring
+    except Exception:
+        return None
+
+def _kc_set(name, pw):
+    kr = _keyring_mod()
+    if kr is not None:
+        try: kr.set_password(KC_SERVICE, name, pw); return True
+        except Exception: return False
+    if sys.platform == "darwin":
+        r = subprocess.run(["security", "add-generic-password", "-s", KC_SERVICE,
+                            "-a", name, "-l", f"frsync login: {name}",
+                            "-T", sys.executable, "-w", pw, "-U"],
+                           capture_output=True, text=True)
+        return r.returncode == 0
+    return False
+
+def _kc_get(name):
+    kr = _keyring_mod()
+    if kr is not None:
+        try: return kr.get_password(KC_SERVICE, name)
+        except Exception: return None
+    if sys.platform == "darwin":
+        r = subprocess.run(["security", "find-generic-password", "-s", KC_SERVICE,
+                            "-a", name, "-w"], capture_output=True, text=True)
+        return r.stdout.rstrip("\n") if r.returncode == 0 else None
+    return None
+
+def _kc_del(name):
+    kr = _keyring_mod()
+    if kr is not None:
+        try: kr.delete_password(KC_SERVICE, name)
+        except Exception: pass
+    if sys.platform == "darwin":
+        subprocess.run(["security", "delete-generic-password", "-s", KC_SERVICE,
+                        "-a", name], capture_output=True, text=True)
+
+def can_save_logins():
+    """True if there's an OS keychain we can store passwords in."""
+    return _keyring_mod() is not None or sys.platform == "darwin"
+
+def _load_index():
+    try:
+        with open(LOGINS_INDEX, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return {"names": [n for n in d.get("names", []) if isinstance(n, str)],
+                "ask": bool(d.get("ask", True))}
+    except (OSError, ValueError):
+        return {"names": [], "ask": True}
+
+def _save_index(idx):
+    try:
+        os.makedirs(FRSYNC_DIR, exist_ok=True)
+        with open(LOGINS_INDEX, "w", encoding="utf-8") as fh:
+            json.dump(idx, fh, indent=2)
+    except OSError:
+        pass
+
+def saved_logins():          return _load_index()["names"]
+def asking_to_save():        return _load_index()["ask"]
+def get_login_password(name): return _kc_get(name)
+
+def set_ask(flag):
+    idx = _load_index(); idx["ask"] = flag; _save_index(idx)
+
+def save_login(name, pw):
+    """Store the password in the keychain and record the name. False if the
+    keychain write failed."""
+    if not _kc_set(name, pw):
+        return False
+    idx = _load_index()
+    if name not in idx["names"]:
+        idx["names"].append(name)
+    _save_index(idx)
+    return True
+
+def forget_login(name):
+    _kc_del(name)
+    idx = _load_index()
+    idx["names"] = [n for n in idx["names"] if n != name]
+    _save_index(idx)
+
+# ------------------------------------------------------------ login picker
+def _render_menu(options, sel, first):
+    w = sys.stdout.write
+    if not first:
+        w(f"\x1b[{len(options)}A")          # jump back up to the top of the list
+    for i, opt in enumerate(options):
+        if i == sel:
+            w(f"\r\x1b[K\x1b[7m ▸ {opt} \x1b[0m\r\n")   # reverse-video the selection
+        else:
+            w(f"\r\x1b[K   {opt}\r\n")
+    sys.stdout.flush()
+
+def pick_login(names):
+    """Arrow-navigable menu of saved logins plus a 'new login' entry. Returns the
+    chosen creator name, or None to enter a fresh one. Falls back to a numbered
+    prompt when the terminal isn't interactive/raw-capable."""
+    options = names + ["+ log in as someone else"]
+    print("\r\n  Saved logins — ↑/↓ to choose, Enter to connect:\r\n")
+    # POSIX raw
+    if termios is not None and tty is not None and sys.stdin.isatty():
+        fd = sys.stdin.fileno(); old = termios.tcgetattr(fd); sel = 0
+        _render_menu(options, sel, True)
+        tty.setcbreak(fd)
+        try:
+            while True:
+                ch = os.read(fd, 3)
+                if ch in (b"\r", b"\n"): break
+                elif ch == b"\x1b[A": sel = (sel - 1) % len(options)
+                elif ch == b"\x1b[B": sel = (sel + 1) % len(options)
+                elif ch == b"\x03": raise KeyboardInterrupt
+                elif ch[:1].isdigit() and 1 <= int(ch[:1]) <= len(options): sel = int(ch[:1]) - 1
+                _render_menu(options, sel, False)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        print()
+        return names[sel] if sel < len(names) else None
+    # Windows raw
+    if msvcrt is not None and sys.stdin.isatty():
+        sel = 0; _render_menu(options, sel, True)
+        while True:
+            ch = msvcrt.getwch()                       # type: ignore[union-attr]
+            if ch in ("\r", "\n"): break
+            elif ch in ("\x00", "\xe0"):
+                code = msvcrt.getwch()                 # type: ignore[union-attr]
+                if code == "H": sel = (sel - 1) % len(options)
+                elif code == "P": sel = (sel + 1) % len(options)
+            elif ch == "\x03": raise KeyboardInterrupt
+            elif ch.isdigit() and 1 <= int(ch) <= len(options): sel = int(ch) - 1
+            _render_menu(options, sel, False)
+        print()
+        return names[sel] if sel < len(names) else None
+    # cooked fallback: numbered menu
+    for i, opt in enumerate(options): print(f"  {i + 1}) {opt}")
+    try: pickn = int(input("Choose a number: ").strip())
+    except (ValueError, EOFError): pickn = len(options)
+    return names[pickn - 1] if 1 <= pickn <= len(names) else None
+
+def resolve_login(args):
+    """Work out (creator, password): pick a saved login (and reuse its stored
+    password) when possible, otherwise prompt. --char and $FRPASS still win."""
+    char, names = args.char, saved_logins()
+    if char is None and names and sys.stdin.isatty() and not os.environ.get("FRPASS"):
+        picked = pick_login(names)
+        if picked:
+            pw = get_login_password(picked)
+            if pw:
+                return picked, pw
+            print(f"(couldn't read the saved password for {picked} — type it)")
+            char = picked
+    if char is None:
+        char = input("Creator name: ").strip()
+    pw = os.environ.get("FRPASS") or get_login_password(char) \
+         or getpass.getpass(f"Password for {char}: ")
+    return char, pw
+
+def offer_save(char, pw):
+    """After a successful login, offer to remember it (unless already saved or
+    the user said don't-ask)."""
+    if not can_save_logins() or not asking_to_save():
+        return
+    if char in saved_logins() and get_login_password(char) == pw:
+        return
+    try:
+        ans = input(f"Save this login for '{char}' so you can pick it next time? "
+                    "[y]es / [n]o / [d]on't ask again: ").strip().lower()[:1]
+    except EOFError:
+        return
+    if ans == "y":
+        print("Saved to your OS keychain." if save_login(char, pw)
+              else "Couldn't write to the keychain — not saved.")
+    elif ans == "d":
+        set_ask(False)
+        print("Okay, I won't ask again  (re-enable with: frsync logins --ask).")
+
 def connect(args):
-    char = args.char or input("Creator name: ").strip()
-    pw = os.environ.get("FRPASS") or getpass.getpass(f"Password for {char}: ")
+    char, pw = resolve_login(args)
     print(f"Connecting to {args.host} {args.port} as {char}…")
     mud = Mud(args.host, args.port)
     mud.login(char, pw)
     print("Logged in.\n")
+    offer_save(char, pw)
     return mud
+
+def cmd_logins(args):
+    """Manage saved logins (list / forget / re-enable the save prompt)."""
+    if args.forget:
+        forget_login(args.forget); print(f"Forgot saved login: {args.forget}"); return
+    if args.forget_all:
+        for n in saved_logins(): forget_login(n)
+        print("Forgot all saved logins."); return
+    if args.ask:
+        set_ask(True); print("Will ask to save logins again."); return
+    names = saved_logins()
+    if not names:
+        print("No saved logins yet." if can_save_logins() else
+              "No saved logins (no OS keychain available here to store them securely).")
+        return
+    print("Saved logins (passwords live in your OS keychain):")
+    for n in names: print(f"  • {n}")
+    print("\nAt connect you pick one with the arrow keys. "
+          "Manage: frsync logins --forget <name> | --forget-all | --ask")
 
 def cmd_status(args):
     mud = connect(args)
@@ -2336,7 +2546,11 @@ def main():
                     help="include BACKUP/ and ATTIC/ archive dirs (excluded by default)")
     mp.add_argument("--max-bytes", type=int, default=1_048_576,
                     help="skip files larger than this (default 1 MB; 0 = no limit)")
-    sub.metavar = "{connect,status,push,pull,watch,mirror}"
+    lp = sub.add_parser("logins", parents=[common], help="list/forget saved logins (arrow-pick them at connect)")
+    lp.add_argument("--forget", metavar="NAME", help="remove a saved login")
+    lp.add_argument("--forget-all", action="store_true", help="remove every saved login")
+    lp.add_argument("--ask", action="store_true", help="re-enable the 'save this login?' prompt")
+    sub.metavar = "{connect,status,push,pull,watch,mirror,logins}"
     args = p.parse_args()
     # The shared flags use SUPPRESS (so a flag given in one position never gets
     # reset by the parser in the other), so fill the baselines for any not given.
@@ -2344,8 +2558,8 @@ def main():
                      delete=False, dry_run=False, yes=False).items():
         if not hasattr(args, k):
             setattr(args, k, v)
-    {"status": cmd_status, "push": cmd_push, "pull": cmd_pull,
-     "watch": cmd_watch, "mirror": cmd_mirror, "connect": cmd_connect}[args.cmd](args)
+    {"status": cmd_status, "push": cmd_push, "pull": cmd_pull, "watch": cmd_watch,
+     "mirror": cmd_mirror, "connect": cmd_connect, "logins": cmd_logins}[args.cmd](args)
 
 if __name__ == "__main__":
     main()

@@ -58,6 +58,14 @@ creator command goes straight to the server (`look`, `ed myroom.c`,
 `update myroom.c`, `ls /w/you`, …). On top of that you get local `/commands`
 for moving files:
 
+**Saved logins.** After you log in, FRsync offers to remember the login
+(**yes / no / don't ask again**). The password goes into your **OS keychain**
+(macOS Keychain, or the cross-platform `keyring` if installed) — never a
+plaintext file; only the creator name is recorded. Next time, it shows your
+saved logins and you pick one with the **arrow keys** and Enter — no retyping.
+Manage them with `frsync logins` (`--forget <name>`, `--forget-all`, `--ask` to
+re-enable the prompt).
+
 | Command | Does |
 |---|---|
 | `/upload <f> [..]`   | send local file(s) → the remote folder (or just **drag files onto the window**) |
