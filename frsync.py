@@ -1024,11 +1024,17 @@ def cmd_connect(args):
              "last_push": []}      # remote paths from the most recent upload (for /update, /goto)
     made = set()
 
-    # Idle keepalive: send a telnet NOP every `secs` so a quiet connection isn't
-    # dropped by a NAT/firewall/server idle timeout (which surfaces as an
-    # ETIMEDOUT on the next read). A NOP is consumed silently by the MUD — tested
-    # to produce no output — so it never clutters the shell. On by default.
-    idle = {"on": True, "secs": 60, "next": time.monotonic() + 60}
+    # Idle keepalive (on by default). Two timers, because the MUD has two idle
+    # timeouts that need different pokes:
+    #   • a silent telnet NOP every `secs` keeps the TCP link from being dropped
+    #     by a NAT/firewall (that drop surfaces as ETIMEDOUT on the next read);
+    #     the NOP is consumed with no output.
+    #   • a bare newline every `mud` seconds resets the MUD's OWN idle-logoff
+    #     (default 30 min), which only counts real commands, not NOPs — so a NOP
+    #     alone won't stop it. 20 min stays well under the default; the only cost
+    #     is a lone "> " prompt line each time.
+    _n = time.monotonic()
+    idle = {"on": True, "secs": 60, "next": _n + 60, "mud": 1200, "mud_next": _n + 1200}
 
     # Overwrite confirmation. Each terminal mode installs its own key reader
     # below (single keypress in raw mode, a line read in the fallback) that
@@ -1319,7 +1325,8 @@ def cmd_connect(args):
         "     /autoupdate on|off  toggle auto-reload after each push\r\n"
         "\r\n"
         "   Session\r\n"
-        "     /idle [on|off|N]  keepalive so an idle link isn't dropped (on, 60s)\r\n"
+        "     /idle [on|off|N]  stay connected when idle: TCP ping every N s (60)\r\n"
+        "                       + a MUD idle-reset so you're not auto-logged-off\r\n"
         "     /where            show current local + remote folders\r\n"
         "     /help             show this help\r\n"
         "     /quit             leave FRsync\r\n"
@@ -1422,9 +1429,10 @@ def cmd_connect(args):
                 idle["secs"] = max(15, int(a[0])); idle["on"] = True
             elif a:
                 out("\r\n  usage: /idle [on|off|<seconds>]\r\n"); return True
-            idle["next"] = time.monotonic() + idle["secs"]
-            out(f"\r\n  idle keepalive: {'on' if idle['on'] else 'off'}"
-                f" (every {idle['secs']}s)\r\n")
+            now = time.monotonic()
+            idle["next"] = now + idle["secs"]; idle["mud_next"] = now + idle["mud"]
+            out(f"\r\n  idle keepalive: {'on' if idle['on'] else 'off'}  "
+                f"(TCP ping {idle['secs']}s · MUD idle-reset every {idle['mud'] // 60}m)\r\n")
         elif cmd in ("/rm", "/del", "/delete"):
             if not a: out("\r\n  usage: /rm <file|glob> [..]   (deletes on the MUD)\r\n"); return True
             targets = []
@@ -1537,15 +1545,22 @@ def cmd_connect(args):
         return True
 
     def maybe_ping():
-        """When the keepalive is on and the interval has elapsed, send a telnet
-        NOP to keep the link warm. Returns False if the link is gone."""
-        if not idle["on"] or time.monotonic() < idle["next"]:
+        """Keep an idle session alive: a silent telnet NOP holds the TCP link
+        open, and a periodic newline resets the MUD's own idle-logoff (which only
+        counts real commands). Returns False if the link is gone."""
+        if not idle["on"]:
             return True
-        idle["next"] = time.monotonic() + idle["secs"]
-        try:
-            mud.s.sendall(bytes([255, 241]))       # IAC NOP — silently consumed
-        except OSError:
-            out("\r\n*** MUD connection lost. ***\r\n"); return False
+        now = time.monotonic()
+        pokes = []
+        if now >= idle["next"]:
+            idle["next"] = now + idle["secs"]; pokes.append(bytes([255, 241]))  # IAC NOP (silent)
+        if now >= idle["mud_next"]:
+            idle["mud_next"] = now + idle["mud"]; pokes.append(b"\n")            # reset MUD idle timer
+        for p in pokes:
+            try:
+                mud.s.sendall(p)
+            except OSError:
+                out("\r\n*** MUD connection lost. ***\r\n"); return False
         return True
 
     _termios, _tty = termios, tty   # locals so the None-guards below narrow cleanly
