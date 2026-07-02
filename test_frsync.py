@@ -447,6 +447,42 @@ def test_lineeditor_autocomplete():
     ed3.buf = list("/download c"); ed3.key("tab"); assert "".join(ed3.buf) == "/download clearing.c "
 
 
+def test_saved_logins(tmpdir):
+    # in-memory keychain + temp index, so the real OS keychain/home are untouched
+    store = {}
+    orig = (frsync._kc_set, frsync._kc_get, frsync._kc_del,
+            frsync.LOGINS_INDEX, frsync.FRSYNC_DIR)
+    frsync._kc_set = lambda n, p: (store.__setitem__(n, p) or True)
+    frsync._kc_get = lambda n: store.get(n)
+    frsync._kc_del = lambda n: store.pop(n, None)
+    frsync.LOGINS_INDEX = os.path.join(tmpdir, "logins.json")
+    frsync.FRSYNC_DIR = tmpdir
+    try:
+        assert frsync.saved_logins() == [] and frsync.asking_to_save() is True
+        assert frsync.save_login("Malric", "pw1") is True
+        assert frsync.save_login("Ducky", "pw2") is True
+        assert frsync.saved_logins() == ["Malric", "Ducky"]        # index holds names, in order
+        assert frsync.get_login_password("Malric") == "pw1"        # password from the keychain
+        assert "pw1" not in open(frsync.LOGINS_INDEX).read()       # never written to the file
+        # re-saving updates the password but not the name list (no dupes)
+        frsync.save_login("Malric", "pw1b")
+        assert frsync.saved_logins() == ["Malric", "Ducky"]
+        assert frsync.get_login_password("Malric") == "pw1b"
+        # don't-ask persists across loads
+        frsync.set_ask(False); assert frsync.asking_to_save() is False
+        # forget drops it from both index and keychain
+        frsync.forget_login("Malric")
+        assert frsync.saved_logins() == ["Ducky"]
+        assert frsync.get_login_password("Malric") is None
+        # if the keychain write fails, the name is NOT recorded
+        frsync._kc_set = lambda n, p: False
+        assert frsync.save_login("Nope", "x") is False
+        assert "Nope" not in frsync.saved_logins()
+    finally:
+        (frsync._kc_set, frsync._kc_get, frsync._kc_del,
+         frsync.LOGINS_INDEX, frsync.FRSYNC_DIR) = orig
+
+
 def test_unified_diff_lines():
     # MUD copy is the 'before', local is the 'after': + is what a push would
     # apply, - is MUD-only content (e.g. a live `ed` edit that drifted).
@@ -563,6 +599,7 @@ def main():
         ("area lint: macros + references",           lambda: test_area_lint_parsing()),
         ("area lint: custom exit wrapper",           lambda: test_lint_custom_exit_wrapper()),
         ("line editor autocomplete + hint",          lambda: test_lineeditor_autocomplete()),
+        ("saved logins index + keychain",            lambda: test_saved_logins(tmp)),
     ]
     failed = 0
     for name, fn in tests:
