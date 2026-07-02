@@ -77,6 +77,7 @@ for moving files:
 | `/lcd <dir>`         | change the **local** folder (downloads land here) |
 | `/rcd <dir>`         | change the **remote** folder (transfers use this) |
 | `/lpwd`, `/lls`      | print / list the local folder |
+| `/idle [on\|off\|N]` | keepalive so an idle connection isn't dropped (on by default, every 60s) |
 | `/help`, `/quit`     | full command list / leave |
 
 Type `/` and the matching commands appear after your cursor, narrowing as you
@@ -354,6 +355,8 @@ A few things worth knowing:
   cleanly** and listed in `.frsync_skipped.txt`.
 - It **auto-reconnects** if the MUD drops the link, and streams file contents in
   safe chunks (the driver drops very long input lines).
+- The interactive shell keeps an idle connection alive with a silent keepalive
+  (`/idle`), and if the link dies anyway it exits cleanly instead of crashing.
 
 ---
 
